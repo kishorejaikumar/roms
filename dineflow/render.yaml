@@ -1,0 +1,14 @@
+# Render Blueprint: New + -> Blueprint -> pick your GitHub repo. Then set DATABASE_URL in the dashboard.
+services:
+  - type: web
+    name: dineflow
+    runtime: node
+    rootDir: server
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: TOKEN_SECRET
+        generateValue: true
