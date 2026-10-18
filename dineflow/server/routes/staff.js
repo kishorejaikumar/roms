@@ -19,6 +19,13 @@ router.post('/kitchen/orders/:id/status', requireRole('kitchen', 'admin'), wrap(
   res.json({ status: rows[0].status });
 }));
 
+// live floor map (kitchen + admin)
+router.get('/floor', requireRole('kitchen', 'admin'), wrap(async (req, res) => {
+  await query(actor(req), 'SELECT fn_expire_reservations()');
+  res.json({ tables: await query(actor(req), `SELECT table_id AS id, table_no AS no, capacity, area, state, order_no AS "orderNo", order_status AS "orderStatus",
+      minutes_seated AS minutes, booking_start AS "bookingStart", booking_party AS "bookingParty" FROM v_floor_map`) });
+}));
+
 // ---------- admin only ----------
 const admin = requireRole('admin');
 router.get('/admin/orders', admin, wrap(async (req, res) => {
@@ -48,6 +55,29 @@ router.post('/admin/restock-low', admin, wrap(async (req, res) => {
   const [r] = await query(actor(req), 'SELECT fn_restock_low_items($1) AS n', [int(req.body.target || 50, 'target')]);
   res.json({ restocked: r.n });
 }));
+// menu management: list everything (also hidden dishes), add a category, add a dish, hide or show a dish
+router.get('/admin/menu', admin, wrap(async (req, res) => {
+  res.json({ items: await query(actor(req), `SELECT m.item_id AS id, m.name, c.name AS category, m.category_id AS "categoryId", m.price, m.is_veg AS veg,
+      m.stock_qty AS stock, m.is_active AS active, m.is_sold_out AS "soldOut" FROM menu_items m JOIN categories c USING (category_id) ORDER BY c.display_order, m.name`) });
+}));
+router.get('/admin/categories', admin, wrap(async (req, res) => {
+  res.json({ categories: await query(actor(req), 'SELECT category_id AS id, name FROM categories ORDER BY display_order, name') });
+}));
+router.post('/admin/categories', admin, wrap(async (req, res) => {
+  const [r] = await query(actor(req), 'SELECT fn_add_category($1) AS id', [String(req.body.name || '')]);
+  res.status(201).json({ id: r.id });
+}));
+router.post('/admin/menu', admin, wrap(async (req, res) => {
+  const b = req.body || {};
+  const [r] = await query(actor(req), 'SELECT fn_add_menu_item($1,$2,$3,$4,$5,$6,$7) AS id',
+    [int(b.categoryId, 'category'), String(b.name || ''), Number(b.price), b.veg !== false, Number.isInteger(+b.stock) ? +b.stock : -1,
+     b.description ? String(b.description).slice(0, 200) : null, Number.isInteger(+b.reorderLevel) ? +b.reorderLevel : 10]);
+  res.status(201).json({ id: r.id });
+}));
+router.post('/admin/menu/:id/active', admin, wrap(async (req, res) => {
+  await query(actor(req), 'SELECT fn_set_item_active($1,$2)', [int(req.params.id, 'dish'), req.body.active === true]);
+  res.json({ ok: true });
+}));
 router.put('/admin/menu/:id', admin, wrap(async (req, res) => {
   const price = Number(req.body.price); if (!(price > 0) || price > 100000) throw bad('Price must be above 0');
   const rows = await query(actor(req), 'UPDATE menu_items SET price = $1 WHERE item_id = $2 RETURNING item_id', [price, int(req.params.id, 'dish')]);
@@ -74,7 +104,7 @@ router.get('/admin/reports/item-sales', admin, wrap(async (req, res) => {       
   res.json({ rows: await query(actor(req), 'SELECT item_name AS name, SUM(units_sold) AS units, SUM(revenue) AS revenue FROM mv_item_sales_daily GROUP BY item_name ORDER BY units DESC LIMIT 10') });
 }));
 router.post('/admin/reports/refresh', admin, wrap(async (req, res) => {
-  await query(actor(req), 'REFRESH MATERIALIZED VIEW mv_item_sales_daily'); res.json({ ok: true });
+  await query(actor(req), 'SELECT fn_refresh_reports()'); res.json({ ok: true });
 }));
 router.post('/admin/settlement', admin, wrap(async (req, res) => {
   const d = new Date(String(req.body.date || '')); if (isNaN(d)) throw bad('Choose a date');

@@ -22,7 +22,7 @@ Also in the UI: log in as kitchen, try the buttons; only legal next steps exist,
 
 ## 3. Last item from two tabs (1 min)
 Rasmalai has stock 1 (see `SELECT * FROM v_low_stock;`). Sign in as two different customers in two windows, add Rasmalai to both carts, press Place order in both at nearly the same moment.
-Exactly one succeeds; the other shows "Rasmalai is sold out". Explain `SELECT ... FOR UPDATE` on the menu row. (Automated version: `npm test`, check 40.)
+Exactly one succeeds; the other shows "Rasmalai is sold out". Explain `SELECT ... FOR UPDATE` on the menu row. (Automated version: `npm test`, check 34.)
 
 ## 4. Reserve an already-booked table (45 s)
 Reserve page -> pick tomorrow 20:00, 4 guests: T04 is already booked by the seed data. In psql:
@@ -41,6 +41,23 @@ Point at: Seq Scan 3.490 ms -> Index Scan 0.226 ms (status filter); my-orders qu
 ## 6. Run the automated tests (30 s)
 ```sql
 SELECT test_no, unit, passed, test_name FROM fn_run_tests();
-SELECT count(*) FILTER (WHERE passed) AS passed, count(*) AS total FROM fn_run_tests();   -- 52 / 52
+SELECT count(*) FILTER (WHERE passed) AS passed, count(*) AS total FROM fn_run_tests();   -- 65 / 65
 ```
 Close with: `SELECT * FROM fn_sales_by('category', current_date-7, current_date);` and `CALL sp_daily_settlement(current_date-1); SELECT * FROM daily_settlement;`.
+
+## 7. Bonus: security and recovery (1 min)
+```sql
+SELECT test_no, passed, test_name FROM fn_run_security_tests();     -- 23 / 23
+SET LOCAL ROLE df_customer; SELECT set_config('dineflow.user_id','1',true);
+SELECT count(*) FROM orders;            -- only this customer's orders (row-level security)
+SELECT password_hash FROM customers;    -- ERROR: permission denied
+```
+```bash
+./db/backup_restore.sh demo             # backup -> delete all orders on a copy -> restore -> VERIFY OK
+```
+Open the admin **Floor map** tab: free, reserved-soon and occupied tables with order status, refreshing every 5 seconds.
+
+## 8. Bonus: new features (2 min)
+1. **Session limit:** sign in; the top bar shows "session 59 min left" (customer) or about 29 (staff).
+2. **Add a dish:** admin, Stock & prices, fill Add a new dish, press Add dish, then open the customer menu: it is there. Press Hide: it disappears and `fn_place_order` refuses it.
+3. **Reservation rules:** reserve a table, try a second booking at the same time (refused), try a fourth upcoming booking (refused), cancel one (works again).

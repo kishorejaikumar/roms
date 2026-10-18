@@ -1,14 +1,15 @@
 // Sign-in, menu and table availability.
 const router = require('express').Router();
 const { query } = require('../db');
-const { makeToken, requireRole, limiter } = require('../auth');
+const { makeToken, readToken, requireRole, limiter } = require('../auth');
+const session = (user) => { const token = makeToken(user); return { token, user, expiresAt: readToken(token).exp }; };   // expiresAt = epoch seconds
 const { wrap, bad, str, int } = require('../util');
 const anon = { role: 'anonymous' };
 
 router.post('/auth/register', limiter, wrap(async (req, res) => {
   const { name, email, phone, password } = req.body || {};
   const [row] = await query(anon, 'SELECT fn_register_customer($1,$2,$3,$4) AS id', [str(name, 'name', 80), str(email, 'email'), String(phone || ''), String(password || '')]);
-  res.status(201).json({ token: makeToken({ id: row.id, role: 'customer', name: name.trim() }), user: { id: row.id, role: 'customer', name: name.trim() } });
+  res.status(201).json(session({ id: row.id, role: 'customer', name: name.trim() }));
 }));
 
 router.post('/auth/login', limiter, wrap(async (req, res) => {
@@ -16,8 +17,7 @@ router.post('/auth/login', limiter, wrap(async (req, res) => {
   const [u] = await query(anon, 'SELECT * FROM fn_login_customer($1,$2)', [String(email || ''), String(password || '')]);
   if (!u) { req.loginFailed(); return res.status(401).json({ error: 'Wrong email or password' }); }
   req.loginOk();
-  const user = { id: u.customer_id, role: 'customer', name: u.full_name };
-  res.json({ token: makeToken(user), user });
+  res.json(session({ id: u.customer_id, role: 'customer', name: u.full_name }));
 }));
 
 router.post('/auth/staff-login', limiter, wrap(async (req, res) => {
@@ -25,11 +25,10 @@ router.post('/auth/staff-login', limiter, wrap(async (req, res) => {
   const [u] = await query(anon, 'SELECT * FROM fn_login_staff($1,$2)', [String(email || ''), String(password || '')]);
   if (!u) { req.loginFailed(); return res.status(401).json({ error: 'Wrong email or password' }); }
   req.loginOk();
-  const user = { id: u.staff_id, role: u.role, name: u.full_name };
-  res.json({ token: makeToken(user), user });
+  res.json(session({ id: u.staff_id, role: u.role, name: u.full_name }));
 }));
 
-router.get('/auth/me', requireRole('customer', 'kitchen', 'admin'), (req, res) => res.json({ user: req.user }));
+router.get('/auth/me', requireRole('customer', 'kitchen', 'admin'), (req, res) => res.json({ user: req.user, expiresAt: req.user.exp }));
 
 router.get('/menu', wrap(async (_req, res) => {
   const rows = await query(anon, `SELECT m.item_id AS id, m.name, m.description, m.price, m.is_veg AS veg, m.is_sold_out AS "soldOut",
@@ -48,13 +47,14 @@ router.get('/tables/available', wrap(async (req, res) => {
   res.json({ tables: rows });
 }));
 
-router.get('/tables', wrap(async (_req, res) => {      // tables a customer can currently choose for dine-in (no live order, active)
-  res.json({ tables: await query(anon, `SELECT t.table_id AS id, t.table_no AS no, t.capacity, t.area FROM restaurant_tables t
-     WHERE t.is_active AND NOT EXISTS (SELECT 1 FROM orders o WHERE o.table_id = t.table_id AND o.status NOT IN ('Paid','Cancelled')) ORDER BY t.table_no`) });
+router.get('/tables', wrap(async (req, res) => {       // tables a customer can pick for dine-in, flagged for THIS customer
+  const rows = req.user && req.user.role === 'customer'
+    ? await query({ role: 'customer', id: req.user.id }, 'SELECT table_id AS id, no, capacity, area, state, reservation_id AS "reservationId", booking_start AS "bookingStart" FROM fn_tables_for_customer($1)', [req.user.id])
+    : await query(anon, "SELECT table_id AS id, no, capacity, area, 'free' AS state, NULL::int AS \"reservationId\", NULL::timestamptz AS \"bookingStart\" FROM fn_free_tables()");
+  res.json({ tables: rows });
 }));
 
 router.get('/reviews/dish/:id', wrap(async (req, res) => {
-  res.json({ reviews: await query(anon, `SELECT r.rating, r.comment, r.created_at, split_part(c.full_name, ' ', 1) AS who
-     FROM reviews r JOIN customers c USING (customer_id) WHERE r.item_id = $1 ORDER BY r.created_at DESC LIMIT 20`, [int(req.params.id, 'dish')]) });
+  res.json({ reviews: await query(anon, 'SELECT rating, comment, created_at, who FROM v_public_reviews WHERE item_id = $1 ORDER BY created_at DESC LIMIT 20', [int(req.params.id, 'dish')]) });
 }));
 module.exports = router;

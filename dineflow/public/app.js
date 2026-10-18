@@ -13,7 +13,7 @@ function toast(m) { const e = $('#toast'); e.textContent = m; e.style.display = 
 async function api(method, url, body) {
   const r = await fetch('/api' + url, { method, headers: { 'Content-Type': 'application/json', ...(S.token ? { Authorization: 'Bearer ' + S.token } : {}) }, body: body ? JSON.stringify(body) : undefined });
   const j = await r.json().catch(() => ({}));
-  if (r.status === 401 && S.token) { logout(true); }
+  if (r.status === 401 && S.token) { logout(true); toast('Your session has ended. Please sign in again.'); }
   if (!r.ok) throw new Error(j.error || 'Something went wrong');
   return j;
 }
@@ -23,12 +23,13 @@ function logout(silent) { S.token = null; S.user = null; localStorage.removeItem
 
 // ---------------- navigation ----------------
 const NAV = { guest: [['menu', 'Menu']], customer: [['menu', 'Menu & cart'], ['reserve', 'Reserve a table'], ['orders', 'My orders']],
-              kitchen: [['kitchen', 'Kitchen display']], admin: [['a-orders', 'Orders'], ['kitchen', 'Kitchen'], ['stock', 'Stock & prices'], ['reports', 'Reports']] };
+              kitchen: [['kitchen', 'Kitchen display'], ['floor', 'Floor map']], admin: [['a-orders', 'Orders'], ['kitchen', 'Kitchen'], ['floor', 'Floor map'], ['stock', 'Stock & prices'], ['reports', 'Reports']] };
 function chrome() {
   const role = S.user ? S.user.role : 'guest';
   $('#nav').innerHTML = NAV[role].map(([v, l]) => `<button data-act="go" data-v="${v}" ${S.view === v ? 'aria-current="page"' : ''}>${l}</button>`).join('');
-  $('#who').innerHTML = S.user ? `<span>${esc(S.user.name)} · ${esc(S.user.role)}</span><button class="btn alt sm" data-act="logout">Sign out</button>`
+  $('#who').innerHTML = S.user ? `<span>${esc(S.user.name)} · ${esc(S.user.role)} · <span id="sess"></span></span><button class="btn alt sm" data-act="logout">Sign out</button>`
                                : `<button class="btn sm" data-act="go" data-v="auth">Sign in</button><button class="btn alt sm" data-act="go" data-v="staff">Staff</button>`;
+  if (typeof sessionTick === 'function') sessionTick();
 }
 async function go(view) {
   clearInterval(S.timer); S.view = view; chrome();
@@ -46,6 +47,8 @@ const VIEWS = {};
 VIEWS.menu = async () => {
   S.menu = (await api('GET', '/menu')).items;
   if (S.user && S.user.role === 'customer') S.tables = (await api('GET', '/tables')).tables;
+  const mine = S.tables.find((t) => t.state === 'mine');                    // the guest's own usable reservation
+  if (mine && !S.form.table) { S.form.table = String(mine.id); S.form.type = 'Dine-in'; }
   const cats = [...new Set(S.menu.map((m) => m.category))];
   const list = cats.map((c) => `<h2>${esc(c)}</h2><div class="grid">${S.menu.filter((m) => m.category === c).map(dish).join('')}</div>`).join('');
   return `<div class="hero"><h1>Order from your table or take it away</h1><p class="mute">Sign in, add dishes, apply a coupon and pay by UPI, card or cash.</p></div>
@@ -70,7 +73,7 @@ function cartPanel() {
   const lines = Object.entries(S.cart).map(([id, q]) => { const m = S.menu.find((x) => x.id == id); return `<div class="row"><span>${q} × ${esc(m.name)}</span><span>${rs(q * m.price)}</span></div>`; }).join('') || '<p class="mute">Your cart is empty.</p>';
   return `<div class="card sum"><h2>Your order</h2>${lines}
     <label for="f-type">Order type</label><select id="f-type" data-f="type"><option ${f.type === 'Dine-in' ? 'selected' : ''}>Dine-in</option><option ${f.type === 'Takeaway' ? 'selected' : ''}>Takeaway</option></select>
-    ${f.type === 'Dine-in' ? `<label for="f-table">Table</label><select id="f-table" data-f="table"><option value="">Choose a free table</option>${S.tables.map((t) => `<option value="${t.id}" ${f.table == t.id ? 'selected' : ''}>${esc(t.no)} · ${t.capacity} seats · ${esc(t.area)}</option>`).join('')}</select>` : ''}
+    ${f.type === 'Dine-in' ? `<label for="f-table">Table</label><select id="f-table" data-f="table"><option value="">Choose a free table</option>${S.tables.map((t) => `<option value="${t.id}" ${f.table == t.id ? 'selected' : ''} ${t.state === 'reserved' ? 'disabled' : ''}>${esc(t.no)} · ${t.capacity} seats · ${esc(t.area)}${t.state === 'mine' ? ' · your reservation' : t.state === 'reserved' ? ' · reserved ' + new Date(t.bookingStart).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''}</option>`).join('')}</select>` : ''}
     <label for="f-code">Coupon code</label><div class="row"><input id="f-code" data-f="code" value="${esc(f.code)}" placeholder="e.g. WELCOME10" maxlength="20"><button class="btn alt sm" data-act="coupon">Apply</button></div>
     <label for="f-method">Pay by</label><select id="f-method" data-f="method">${['Cash', 'UPI', 'Card'].map((m) => `<option ${f.method === m ? 'selected' : ''}>${m}</option>`).join('')}</select>
     ${f.method === 'UPI' ? `<label for="f-upi">UPI id</label><input id="f-upi" data-f="upi" value="${esc(f.upi)}" placeholder="name@okbank">` : ''}
@@ -118,6 +121,16 @@ VIEWS.kitchen = async () => {
 };
 VIEWS.kitchen.poll = true;
 
+VIEWS.floor = async () => {
+  const ts = (await api('GET', '/floor')).tables, n = (st) => ts.filter((t) => t.state === st).length;
+  const cls = (t) => t.state === 'Occupied' ? 'fl-' + t.orderStatus : 'fl-' + t.state;
+  const detail = (t) => t.state === 'Occupied' ? `#${t.orderNo} · ${esc(t.orderStatus)}<br>${t.minutes} min` : t.state === 'Reserved' ? `Booked ${new Date(t.bookingStart).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}<br>${t.bookingParty} guests` : 'Free';
+  return `<h1>Live floor map</h1><p class="mute">${n('Free')} free · ${n('Reserved')} reserved soon · ${n('Occupied')} occupied. Refreshes every 5 seconds.</p>
+    <div class="legend">${['Free', 'Reserved', 'Placed', 'Preparing', 'Served', 'Billed'].map((k) => `<span><i class="fl-${k}"></i>${k === 'Reserved' ? 'Reserved (within 1 h)' : k}</span>`).join('')}</div>
+    <div class="floor">${ts.map((t) => `<div class="tile ${cls(t)}"><b>${esc(t.no)}</b><span>${t.capacity} seats · ${esc(t.area)}</span><span>${detail(t)}</span></div>`).join('')}</div>`;
+};
+VIEWS.floor.poll = true;
+
 VIEWS['a-orders'] = async () => {
   const f = S.adminFilter || '';
   const os = (await api('GET', '/admin/orders' + (f ? '?status=' + f : ''))).orders;
@@ -132,11 +145,23 @@ VIEWS['a-orders'] = async () => {
 VIEWS['a-orders'].poll = true;
 
 VIEWS.stock = async () => {
-  const low = (await api('GET', '/admin/low-stock')).items, menu = (await api('GET', '/menu')).items;
-  return `<h1>Stock & prices</h1><div class="cols"><section class="card"><div class="row"><h2>Low stock</h2><button class="btn sm" data-act="restock-low">Top up all to 50</button></div>
+  const low = (await api('GET', '/admin/low-stock')).items, menu = (await api('GET', '/admin/menu')).items, cats = (await api('GET', '/admin/categories')).categories;
+  return `<h1>Stock & prices</h1>
+  <section class="card"><h2>Add a new dish</h2>
+    <div class="grid" style="grid-template-columns:repeat(auto-fill,minmax(190px,1fr))">
+      <div><label for="nd-n">Dish name</label><input id="nd-n" maxlength="80"></div>
+      <div><label for="nd-c">Category</label><select id="nd-c">${cats.map((c) => `<option value="${c.id}">${esc(c.name)}</option>`).join('')}</select></div>
+      <div><label for="nd-p">Price (₹)</label><input id="nd-p" type="number" min="1" step="0.5"></div>
+      <div><label for="nd-s">Opening stock</label><input id="nd-s" type="number" min="0" value="20"></div>
+      <div><label for="nd-v">Type</label><select id="nd-v"><option value="1">Veg</option><option value="0">Non-veg</option></select></div>
+      <div><label for="nd-d">Description</label><input id="nd-d" maxlength="200"></div></div>
+    <p><button class="btn" data-act="add-dish">Add dish</button></p>
+    <div class="row" style="justify-content:flex-start"><input id="nc-n" placeholder="New category name" maxlength="40" style="max-width:240px" aria-label="New category name"><button class="btn alt" data-act="add-cat">Add category</button></div></section>
+  <div class="cols" style="margin-top:14px"><section class="card"><div class="row"><h2>Low stock</h2><button class="btn sm" data-act="restock-low">Top up all to 50</button></div>
     ${low.length ? low.map((i) => `<div class="row" style="padding:6px 0"><span>${esc(i.name)} <span class="mute">(${esc(i.category)})</span><br><b>${i.stock}</b> left ${i.soldOut ? '· <span style="color:var(--bad)">sold out</span>' : ''}</span>
       <span class="row"><input type="number" min="1" value="20" style="width:80px" id="rs-${i.id}" aria-label="Quantity to add to ${esc(i.name)}"><button class="btn sm" data-act="restock" data-id="${i.id}">Add</button></span></div>`).join('') : '<p class="mute">All dishes are above their reorder level.</p>'}</section>
-    <aside class="card"><h2>Menu prices</h2>${menu.map((m) => `<div class="row" style="padding:4px 0"><label for="pr-${m.id}" style="margin:0;color:var(--ink)">${esc(m.name)}</label><input id="pr-${m.id}" type="number" min="1" value="${m.price}" data-price="${m.id}" style="width:100px"></div>`).join('')}</aside></div>`;
+    <aside class="card"><h2>Menu prices and visibility</h2>${menu.map((m) => `<div class="row" style="padding:4px 0"><label for="pr-${m.id}" style="margin:0;color:var(--ink)">${esc(m.name)}${m.active ? '' : ' <span class="tag st-Cancelled">hidden</span>'}</label>
+      <span class="row"><input id="pr-${m.id}" type="number" min="1" value="${m.price}" data-price="${m.id}" style="width:90px"><button class="btn alt sm" data-act="toggle-dish" data-id="${m.id}" data-active="${m.active ? 1 : 0}">${m.active ? 'Hide' : 'Show'}</button></span></div>`).join('')}</aside></div>`;
 };
 
 VIEWS.reports = async () => {
@@ -165,16 +190,17 @@ const payBody = (id) => ({ method: $(`#${id}m`).value, upiRef: $(`#${id}ui`).val
 const H = {
   go: (b) => go(b.dataset.v), logout: () => logout(), close: () => dlg.close(),
   tab: (b) => { $('#auth-in').hidden = b.dataset.t !== 'in'; $('#auth-up').hidden = b.dataset.t !== 'up'; },
-  login: act(async () => { const r = await api('POST', '/auth/login', { email: $('#li-e').value, password: $('#li-p').value }); setUser(r.token, r.user); toast('Welcome, ' + r.user.name); go('menu'); }),
-  register: act(async () => { const r = await api('POST', '/auth/register', { name: $('#re-n').value, email: $('#re-e').value, phone: $('#re-ph').value, password: $('#re-p').value }); setUser(r.token, r.user); toast('Account created'); go('menu'); }),
-  'staff-login': act(async () => { const r = await api('POST', '/auth/staff-login', { email: $('#st-e').value, password: $('#st-p').value }); setUser(r.token, r.user); go(r.user.role === 'admin' ? 'a-orders' : 'kitchen'); }),
+  login: act(async () => { const r = await api('POST', '/auth/login', { email: $('#li-e').value, password: $('#li-p').value }); setUser(r.token, { ...r.user, exp: r.expiresAt }); toast('Welcome, ' + r.user.name); go('menu'); }),
+  register: act(async () => { const r = await api('POST', '/auth/register', { name: $('#re-n').value, email: $('#re-e').value, phone: $('#re-ph').value, password: $('#re-p').value }); setUser(r.token, { ...r.user, exp: r.expiresAt }); toast('Account created'); go('menu'); }),
+  'staff-login': act(async () => { const r = await api('POST', '/auth/staff-login', { email: $('#st-e').value, password: $('#st-p').value }); setUser(r.token, { ...r.user, exp: r.expiresAt }); go(r.user.role === 'admin' ? 'a-orders' : 'kitchen'); }),
   inc: (b) => { const m = S.menu.find((x) => x.id == b.dataset.id); if ((S.cart[m.id] || 0) < Math.min(m.stock, 20)) S.cart[m.id] = (S.cart[m.id] || 0) + 1; else toast('No more stock of ' + m.name); S.coupon = null; keepScroll(); },
   dec: (b) => { const id = b.dataset.id; if (S.cart[id]) S.cart[id]--; if (!S.cart[id]) delete S.cart[id]; S.coupon = null; keepScroll(); },
   coupon: act(async () => { const t = totals(); const r = await api('POST', '/coupons/check', { code: S.form.code, subtotal: t.sub }); S.coupon = { code: S.form.code.toUpperCase(), discount: r.discount }; toast('Coupon applied: −' + rs(r.discount)); keepScroll(); }),
   place: act(async () => {
     const f = S.form; if (f.type === 'Dine-in' && !f.table) throw new Error('Choose a table');
     const items = Object.entries(S.cart).map(([id, qty]) => ({ itemId: +id, qty, price: S.menu.find((m) => m.id == id).price }));
-    await api('POST', '/orders', { orderType: f.type, tableId: f.type === 'Dine-in' ? +f.table : undefined, items, couponCode: S.coupon ? S.coupon.code : undefined, paymentMethod: f.method, upiRef: f.upi, cardLast4: f.card, notes: f.notes });
+    await api('POST', '/orders', { orderType: f.type, tableId: f.type === 'Dine-in' ? +f.table : undefined, items, couponCode: S.coupon ? S.coupon.code : undefined, paymentMethod: f.method, upiRef: f.upi, cardLast4: f.card, notes: f.notes,
+      reservationId: (() => { const tb = S.tables.find((t) => t.id == f.table); return f.type === 'Dine-in' && tb && tb.state === 'mine' ? tb.reservationId : undefined; })() });
     S.cart = {}; S.coupon = null; S.form.code = ''; toast('Order placed. Track it in My orders.'); go('orders');
   }),
   find: act(async () => { const t = $('#rv-t').value; if (!t) throw new Error('Choose a date and time'); S.rv = { start: new Date(t).toISOString(), party: +$('#rv-p').value, minutes: +$('#rv-m').value };
@@ -205,6 +231,9 @@ const H = {
   audit: act(async (b) => { const r = await api('GET', '/admin/audit/' + b.dataset.id); modal(`<h2>Audit trail</h2>${r.trail.map((t) => `<div class="row"><span>${esc(t.from)} → ${esc(t.to)}</span><span class="mute">${esc(t.by)} · ${when(t.at)}</span></div>`).join('') || '<p class="mute">No changes yet.</p>'}`); }),
   restock: act(async (b) => { await api('POST', '/admin/restock', { itemId: +b.dataset.id, qty: +$('#rs-' + b.dataset.id).value }); toast('Restocked'); go('stock'); }),
   'restock-low': act(async () => { const r = await api('POST', '/admin/restock-low', { target: 50 }); toast(r.restocked + ' dishes topped up'); go('stock'); }),
+  'add-dish': act(async () => { await api('POST', '/admin/menu', { categoryId: +$('#nd-c').value, name: $('#nd-n').value, price: +$('#nd-p').value, veg: $('#nd-v').value === '1', stock: +$('#nd-s').value, description: $('#nd-d').value }); toast('Dish added to the menu'); go('stock'); }),
+  'add-cat': act(async () => { await api('POST', '/admin/categories', { name: $('#nc-n').value }); toast('Category added'); go('stock'); }),
+  'toggle-dish': act(async (b) => { await api('POST', `/admin/menu/${b.dataset.id}/active`, { active: b.dataset.active !== '1' }); toast(b.dataset.active === '1' ? 'Dish hidden from customers' : 'Dish is visible again'); go('stock'); }),
   settle: act(async () => { await api('POST', '/admin/settlement', { date: $('#sd').value }); toast('Settlement saved'); go('reports'); }),
   'mv-refresh': act(async () => { await api('POST', '/admin/reports/refresh'); toast('Report refreshed'); go('reports'); })
 };
@@ -220,4 +249,17 @@ document.addEventListener('change', act(async (e) => {
   else if (t.dataset.dim !== undefined) { S.dim = t.value; go('reports'); }
   else if (t.dataset.price) { await api('PUT', '/admin/menu/' + t.dataset.price, { price: +t.value }); toast('Price saved'); }
 }));
-chrome(); go(S.user ? { customer: 'menu', kitchen: 'kitchen', admin: 'a-orders' }[S.user.role] : 'menu');
+// ---- session limits: the server enforces an absolute expiry; the browser also signs out after IDLE_MIN idle minutes
+const IDLE_MIN = 15;
+let lastAct = Date.now(), warned = false;
+['click', 'keydown', 'touchstart'].forEach((ev) => document.addEventListener(ev, () => { lastAct = Date.now(); warned = false; }, { passive: true }));
+function sessionTick() {
+  if (!S.token || !S.user) return;
+  const nowS = Date.now() / 1000, el = $('#sess');
+  if (el && S.user.exp) el.textContent = 'session ' + Math.max(Math.floor((S.user.exp - nowS) / 60), 0) + ' min left';
+  if (S.user.exp && nowS >= S.user.exp) { logout(true); toast('Your session expired. Please sign in again.'); }
+  else if (Date.now() - lastAct > IDLE_MIN * 60000) { logout(true); toast('Signed out after ' + IDLE_MIN + ' minutes of inactivity.'); }
+  else if (!warned && Date.now() - lastAct > (IDLE_MIN - 1) * 60000) { warned = true; toast('You will be signed out in 1 minute unless you click or type.'); }
+}
+setInterval(sessionTick, 15000);
+chrome(); sessionTick(); go(S.user ? { customer: 'menu', kitchen: 'kitchen', admin: 'a-orders' }[S.user.role] : 'menu');

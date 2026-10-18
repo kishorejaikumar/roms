@@ -41,3 +41,8 @@ dialog{border:1px solid var(--line);border-radius:14px;background:var(--sf);colo
 #toast{position:fixed;left:50%;bottom:18px;transform:translateX(-50%);background:var(--ink);color:var(--bg);padding:10px 16px;border-radius:10px;font-size:14px;display:none;z-index:20;max-width:92%}
 :focus-visible{outline:3px solid var(--acc);outline-offset:2px}
 .hero{background:var(--soft);border:1px solid var(--line);border-radius:14px;padding:16px;margin-bottom:14px}
+
+.floor{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:12px}
+.tile{border-radius:14px;padding:14px;min-height:110px;display:flex;flex-direction:column;gap:2px;color:#fff;font-size:13px}.tile b{font-size:24px}
+.fl-Free{background:#2E7D4F}.fl-Reserved{background:#B7791F}.fl-Placed{background:#1F4E9E}.fl-Preparing{background:#C2410C}.fl-Served{background:#5B3A9E}.fl-Billed{background:#B3261E}
+.legend{display:flex;gap:12px;flex-wrap:wrap;font-size:13px;color:var(--mute);margin:8px 0 14px}.legend i{display:inline-block;width:12px;height:12px;border-radius:4px;margin-right:6px;vertical-align:-1px}

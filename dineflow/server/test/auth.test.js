@@ -1,0 +1,20 @@
+// Unit tests for the session logic (no database needed):  node test/auth.test.js
+process.env.TOKEN_SECRET = 'unit-test-secret-unit-test-secret';
+delete process.env.SESSION_MINUTES_CUSTOMER; delete process.env.SESSION_MINUTES_STAFF;
+const { makeToken, readToken, sessionSeconds } = require('../auth');
+let pass = 0, n = 0; const ok = (name, c) => { n++; if (c) pass++; console.log(`${String(n).padStart(2)}  ${c ? 'PASS' : 'FAIL'}  ${name}`); };
+const now = () => Math.floor(Date.now() / 1000);
+const t = makeToken({ id: 1, role: 'customer', name: 'A' });
+ok('a customer token is valid and expires in 60 minutes by default', readToken(t) && readToken(t).exp - now() >= 3599 && readToken(t).exp - now() <= 3600);
+ok('a staff token expires in 30 minutes by default', (() => { const x = readToken(makeToken({ id: 2, role: 'kitchen', name: 'K' })); return x.exp - now() <= 1800 && x.exp - now() >= 1799; })());
+ok('the token carries its issue time', readToken(t).iat <= now() && readToken(t).iat > now() - 5);
+ok('an expired token is rejected', readToken(makeToken({ id: 1, role: 'customer', name: 'A' }, -1)) === null);
+ok('a tampered payload is rejected', (() => { const [p, sg] = t.split('.'); const bad = Buffer.from(JSON.stringify({ id: 99, role: 'admin', name: 'X', exp: now() + 999 })).toString('base64url'); return readToken(bad + '.' + sg) === null; })());
+ok('a token with a wrong signature is rejected', readToken(t.slice(0, -2) + 'xx') === null);
+ok('garbage is rejected', readToken('abc') === null && readToken('') === null && readToken(undefined) === null);
+process.env.SESSION_MINUTES_CUSTOMER = '5'; process.env.SESSION_MINUTES_STAFF = '2';
+ok('SESSION_MINUTES_CUSTOMER changes the customer session length', sessionSeconds('customer') === 300);
+ok('SESSION_MINUTES_STAFF changes the staff session length', sessionSeconds('admin') === 120);
+process.env.SESSION_MINUTES_CUSTOMER = 'abc';
+ok('an invalid setting falls back to the default of 60 minutes', sessionSeconds('customer') === 3600);
+console.log(`\n${pass} of ${n} checks passed`); process.exit(pass === n ? 0 : 1);

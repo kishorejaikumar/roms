@@ -1,5 +1,6 @@
 -- =====================================================================
 -- DineFlow | 24CS303 DBMS | STAGE 2 : UNIT II (SQL programming)
+-- Safe to re-run (functions use OR REPLACE, triggers are dropped and recreated).
 -- Run AFTER 01_schema_er.sql and BEFORE 06_seed_data.sql:
 --   psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/03_sql_programming.sql
 --
@@ -26,10 +27,10 @@ SET search_path = dineflow, public, extensions;
 --      Triggers read them, so the database knows WHO is acting. If nothing is
 --      set the actor is 'system' (a trigger or a psql session).
 -- ---------------------------------------------------------------------
-CREATE FUNCTION fn_ctx_role() RETURNS TEXT LANGUAGE sql STABLE AS $$
+CREATE OR REPLACE FUNCTION fn_ctx_role() RETURNS TEXT LANGUAGE sql STABLE AS $$
   SELECT coalesce(nullif(current_setting('dineflow.role', true), ''), 'system')
 $$;
-CREATE FUNCTION fn_ctx_user() RETURNS INT LANGUAGE sql STABLE AS $$
+CREATE OR REPLACE FUNCTION fn_ctx_user() RETURNS INT LANGUAGE sql STABLE AS $$
   SELECT nullif(current_setting('dineflow.user_id', true), '')::int
 $$;
 
@@ -37,7 +38,7 @@ $$;
 -- 2.2  RULE 5: passwords are hashed INSIDE the database. The backend never
 --      sees or stores a hash; it only calls these functions.
 -- ---------------------------------------------------------------------
-CREATE FUNCTION fn_register_customer(p_name TEXT, p_email TEXT, p_phone TEXT, p_password TEXT)
+CREATE OR REPLACE FUNCTION fn_register_customer(p_name TEXT, p_email TEXT, p_phone TEXT, p_password TEXT)
 RETURNS INT LANGUAGE plpgsql SET search_path = dineflow, public, extensions AS $$
 DECLARE v_id INT;
 BEGIN
@@ -54,14 +55,14 @@ EXCEPTION                                              -- UNIT II: exception han
 END $$;
 
 -- Returns one row on success, no rows on a wrong email/password (same answer for both: no user enumeration).
-CREATE FUNCTION fn_login_customer(p_email TEXT, p_password TEXT)
+CREATE OR REPLACE FUNCTION fn_login_customer(p_email TEXT, p_password TEXT)
 RETURNS TABLE (customer_id INT, full_name TEXT) LANGUAGE sql STABLE SET search_path = dineflow, public, extensions AS $$
   SELECT c.customer_id, c.full_name::text FROM customers c
    WHERE lower(c.email) = lower(trim(p_email)) AND c.is_active
      AND c.password_hash = crypt(p_password, c.password_hash)
 $$;
 
-CREATE FUNCTION fn_login_staff(p_email TEXT, p_password TEXT)
+CREATE OR REPLACE FUNCTION fn_login_staff(p_email TEXT, p_password TEXT)
 RETURNS TABLE (staff_id INT, full_name TEXT, role TEXT) LANGUAGE sql STABLE SET search_path = dineflow, public, extensions AS $$
   SELECT s.staff_id, s.full_name::text, s.role::text FROM staff s
    WHERE lower(s.email) = lower(trim(p_email)) AND s.is_active
@@ -75,7 +76,7 @@ $$;
 --                           (FOR UPDATE) so two buyers cannot both take the last use.
 --                           place_order (Stage 3) increments used_count in the same transaction.
 -- ---------------------------------------------------------------------
-CREATE FUNCTION fn_coupon_discount(p_coupon INT, p_subtotal NUMERIC) RETURNS NUMERIC
+CREATE OR REPLACE FUNCTION fn_coupon_discount(p_coupon INT, p_subtotal NUMERIC) RETURNS NUMERIC
 LANGUAGE plpgsql STABLE AS $$
 DECLARE c coupons%ROWTYPE; v NUMERIC;
 BEGIN
@@ -90,7 +91,7 @@ BEGIN
   RETURN LEAST(v, p_subtotal);                         -- never more than the bill
 END $$;
 
-CREATE FUNCTION fn_check_coupon(p_code TEXT, p_customer INT, p_subtotal NUMERIC) RETURNS INT
+CREATE OR REPLACE FUNCTION fn_check_coupon(p_code TEXT, p_customer INT, p_subtotal NUMERIC) RETURNS INT
 LANGUAGE plpgsql AS $$
 DECLARE c coupons%ROWTYPE; v_used INT;
 BEGIN
@@ -111,7 +112,7 @@ END $$;
 -- 2.4  RULE 1: order total is ALWAYS recomputed by the database.
 --      total = subtotal - coupon discount + 5% GST on the discounted amount.
 -- ---------------------------------------------------------------------
-CREATE FUNCTION fn_recalc_order(p_order INT) RETURNS VOID LANGUAGE plpgsql AS $$
+CREATE OR REPLACE FUNCTION fn_recalc_order(p_order INT) RETURNS VOID LANGUAGE plpgsql AS $$
 DECLARE v_coupon INT; v_sub NUMERIC(10,2); v_disc NUMERIC(10,2); v_tax NUMERIC(10,2);
 BEGIN
   SELECT coupon_id INTO v_coupon FROM orders WHERE order_id = p_order;
@@ -124,17 +125,18 @@ BEGIN
    WHERE order_id = p_order;
 END $$;
 
-CREATE FUNCTION fn_order_items_recalc() RETURNS trigger LANGUAGE plpgsql AS $$
+CREATE OR REPLACE FUNCTION fn_order_items_recalc() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
   PERFORM fn_recalc_order(CASE WHEN TG_OP = 'DELETE' THEN OLD.order_id ELSE NEW.order_id END);
   RETURN NULL;
 END $$;
+DROP TRIGGER IF EXISTS trg_order_items_recalc ON order_items;
 CREATE TRIGGER trg_order_items_recalc AFTER INSERT OR UPDATE OR DELETE ON order_items
   FOR EACH ROW EXECUTE FUNCTION fn_order_items_recalc();
 
 -- Guard: lines can only be added to a Placed order, for a dish that is on sale,
 -- at the CURRENT menu price (the snapshot in unit_price must be honest).
-CREATE FUNCTION fn_order_items_guard() RETURNS trigger LANGUAGE plpgsql AS $$
+CREATE OR REPLACE FUNCTION fn_order_items_guard() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE v_status order_status; m menu_items%ROWTYPE;
 BEGIN
   SELECT status INTO v_status FROM orders WHERE order_id = NEW.order_id;
@@ -147,6 +149,7 @@ BEGIN
   IF NEW.unit_price <> m.price THEN RAISE EXCEPTION 'Price of % has changed to Rs %', m.name, m.price; END IF;
   RETURN NEW;
 END $$;
+DROP TRIGGER IF EXISTS trg_order_items_guard ON order_items;
 CREATE TRIGGER trg_order_items_guard BEFORE INSERT ON order_items
   FOR EACH ROW EXECUTE FUNCTION fn_order_items_guard();
 
@@ -154,7 +157,7 @@ CREATE TRIGGER trg_order_items_guard BEFORE INSERT ON order_items
 -- 2.5  RULE 2: status moves ONLY along status_flow, by an allowed role.
 --      Every change is written to audit_log (feature G).
 -- ---------------------------------------------------------------------
-CREATE FUNCTION fn_orders_status_guard() RETURNS trigger LANGUAGE plpgsql AS $$
+CREATE OR REPLACE FUNCTION fn_orders_status_guard() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE v_roles TEXT[]; v_role TEXT := fn_ctx_role(); v_uid INT := fn_ctx_user(); v_paid NUMERIC;
 BEGIN
   SELECT allowed_roles INTO v_roles FROM status_flow
@@ -180,12 +183,13 @@ BEGIN
   NEW.updated_at := now();
   RETURN NEW;
 END $$;
+DROP TRIGGER IF EXISTS trg_orders_status_guard ON orders;
 CREATE TRIGGER trg_orders_status_guard BEFORE UPDATE ON orders
   FOR EACH ROW WHEN (OLD.status IS DISTINCT FROM NEW.status)
   EXECUTE FUNCTION fn_orders_status_guard();
 
 -- Audit trail for every status change
-CREATE FUNCTION fn_orders_status_audit() RETURNS trigger LANGUAGE plpgsql AS $$
+CREATE OR REPLACE FUNCTION fn_orders_status_audit() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
   INSERT INTO audit_log (table_name, record_id, action, old_data, new_data, changed_by)
   VALUES ('orders', NEW.order_id, 'STATUS',
@@ -193,12 +197,13 @@ BEGIN
           fn_ctx_role() || COALESCE(':' || fn_ctx_user(), ''));
   RETURN NULL;
 END $$;
+DROP TRIGGER IF EXISTS trg_orders_status_audit ON orders;
 CREATE TRIGGER trg_orders_status_audit AFTER UPDATE ON orders
   FOR EACH ROW WHEN (OLD.status IS DISTINCT FROM NEW.status)
   EXECUTE FUNCTION fn_orders_status_audit();
 
 -- Generic row audit (INSERT/UPDATE/DELETE as JSONB). TG_ARGV[0] = primary-key column name.
-CREATE FUNCTION fn_audit_generic() RETURNS trigger LANGUAGE plpgsql AS $$
+CREATE OR REPLACE FUNCTION fn_audit_generic() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE v_id INT;
 BEGIN
   v_id := (to_jsonb(CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END) ->> TG_ARGV[0])::int;
@@ -209,15 +214,18 @@ BEGIN
           fn_ctx_role() || COALESCE(':' || fn_ctx_user(), ''));
   RETURN NULL;
 END $$;
+DROP TRIGGER IF EXISTS trg_audit_orders_ins ON orders;
 CREATE TRIGGER trg_audit_orders_ins   AFTER INSERT ON orders   FOR EACH ROW EXECUTE FUNCTION fn_audit_generic('order_id');
+DROP TRIGGER IF EXISTS trg_audit_payments ON payments;
 CREATE TRIGGER trg_audit_payments     AFTER INSERT OR UPDATE ON payments FOR EACH ROW EXECUTE FUNCTION fn_audit_generic('payment_id');
+DROP TRIGGER IF EXISTS trg_audit_menu_price ON menu_items;
 CREATE TRIGGER trg_audit_menu_price   AFTER UPDATE ON menu_items
   FOR EACH ROW WHEN (OLD.price IS DISTINCT FROM NEW.price) EXECUTE FUNCTION fn_audit_generic('item_id');
 
 -- Cancelling an order undoes its side effects in the SAME transaction:
 -- stock goes back (locked in item_id order, deadlock-safe), the coupon use is released,
 -- successful payments are marked Refunded and pending ones Failed.
-CREATE FUNCTION fn_orders_on_cancel() RETURNS trigger LANGUAGE plpgsql AS $$
+CREATE OR REPLACE FUNCTION fn_orders_on_cancel() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE r RECORD; v_n INT;
 BEGIN
   FOR r IN SELECT item_id, quantity FROM order_items WHERE order_id = NEW.order_id ORDER BY item_id LOOP
@@ -232,12 +240,13 @@ BEGIN
   UPDATE payments SET status = 'Failed'   WHERE order_id = NEW.order_id AND status = 'Pending';
   RETURN NULL;
 END $$;
+DROP TRIGGER IF EXISTS trg_orders_on_cancel ON orders;
 CREATE TRIGGER trg_orders_on_cancel AFTER UPDATE ON orders
   FOR EACH ROW WHEN (NEW.status = 'Cancelled' AND OLD.status IS DISTINCT FROM NEW.status)
   EXECUTE FUNCTION fn_orders_on_cancel();
 
 -- Friendly wrapper used by the API (and by you in psql). Shows exception handling.
-CREATE FUNCTION fn_cancel_order(p_order_id INT, p_role TEXT, p_user_id INT) RETURNS VOID LANGUAGE plpgsql AS $$
+CREATE OR REPLACE FUNCTION fn_cancel_order(p_order_id INT, p_role TEXT, p_user_id INT) RETURNS VOID LANGUAGE plpgsql AS $$
 BEGIN
   PERFORM 1 FROM orders WHERE order_id = p_order_id;
   IF NOT FOUND THEN RAISE EXCEPTION 'Order % does not exist', p_order_id; END IF;
@@ -256,7 +265,7 @@ END $$;
 --      AFTER : when successful payments cover the bill, Served -> Billed -> Paid.
 --      Also runs when an order becomes Served after it was prepaid.
 -- ---------------------------------------------------------------------
-CREATE FUNCTION fn_payments_before() RETURNS trigger LANGUAGE plpgsql AS $$
+CREATE OR REPLACE FUNCTION fn_payments_before() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE v_status order_status; v_total NUMERIC; v_committed NUMERIC;
 BEGIN
   IF NEW.status = 'Success' AND NEW.paid_at IS NULL THEN NEW.paid_at := now(); END IF;
@@ -271,10 +280,11 @@ BEGIN
   END IF;
   RETURN NEW;
 END $$;
+DROP TRIGGER IF EXISTS trg_payments_before ON payments;
 CREATE TRIGGER trg_payments_before BEFORE INSERT OR UPDATE ON payments
   FOR EACH ROW EXECUTE FUNCTION fn_payments_before();
 
-CREATE FUNCTION fn_try_close_order(p_order INT) RETURNS VOID LANGUAGE plpgsql AS $$
+CREATE OR REPLACE FUNCTION fn_try_close_order(p_order INT) RETURNS VOID LANGUAGE plpgsql AS $$
 DECLARE v_status order_status; v_total NUMERIC; v_paid NUMERIC; v_prev TEXT;
 BEGIN
   SELECT status, total_amt INTO v_status, v_total FROM orders WHERE order_id = p_order FOR UPDATE;
@@ -288,13 +298,15 @@ BEGIN
   PERFORM set_config('dineflow.role', v_prev, true);
 END $$;
 
-CREATE FUNCTION fn_payments_after() RETURNS trigger LANGUAGE plpgsql AS $$
+CREATE OR REPLACE FUNCTION fn_payments_after() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN PERFORM fn_try_close_order(NEW.order_id); RETURN NULL; END $$;
+DROP TRIGGER IF EXISTS trg_payments_after ON payments;
 CREATE TRIGGER trg_payments_after AFTER INSERT OR UPDATE ON payments
   FOR EACH ROW WHEN (NEW.status = 'Success') EXECUTE FUNCTION fn_payments_after();
 
-CREATE FUNCTION fn_orders_served_after() RETURNS trigger LANGUAGE plpgsql AS $$
+CREATE OR REPLACE FUNCTION fn_orders_served_after() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN PERFORM fn_try_close_order(NEW.order_id); RETURN NULL; END $$;
+DROP TRIGGER IF EXISTS trg_orders_served_after ON orders;
 CREATE TRIGGER trg_orders_served_after AFTER UPDATE ON orders
   FOR EACH ROW WHEN (NEW.status = 'Served' AND OLD.status IS DISTINCT FROM NEW.status)
   EXECUTE FUNCTION fn_orders_served_after();
@@ -303,7 +315,7 @@ CREATE TRIGGER trg_orders_served_after AFTER UPDATE ON orders
 -- 2.7  RULE 4: a review needs a PAID order, written by the person who placed it.
 --      (The composite FK in 01 already guarantees the dish is on that order.)
 -- ---------------------------------------------------------------------
-CREATE FUNCTION fn_reviews_guard() RETURNS trigger LANGUAGE plpgsql AS $$
+CREATE OR REPLACE FUNCTION fn_reviews_guard() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE v_status order_status; v_owner INT;
 BEGIN
   SELECT status, customer_id INTO v_status, v_owner FROM orders WHERE order_id = NEW.order_id;
@@ -311,6 +323,7 @@ BEGIN
   IF v_owner <> NEW.customer_id THEN RAISE EXCEPTION 'You can only review your own orders'; END IF;
   RETURN NEW;
 END $$;
+DROP TRIGGER IF EXISTS trg_reviews_guard ON reviews;
 CREATE TRIGGER trg_reviews_guard BEFORE INSERT ON reviews
   FOR EACH ROW EXECUTE FUNCTION fn_reviews_guard();
 
@@ -318,25 +331,34 @@ CREATE TRIGGER trg_reviews_guard BEFORE INSERT ON reviews
 -- 2.8  FEATURE B: reservations.
 --      The EXCLUDE constraint (01) is the real guard; these add friendly rules and messages.
 -- ---------------------------------------------------------------------
-CREATE FUNCTION fn_reservation_guard() RETURNS trigger LANGUAGE plpgsql AS $$
-DECLARE v_cap SMALLINT; v_active BOOLEAN;
+CREATE OR REPLACE FUNCTION fn_reservation_guard() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE v_cap SMALLINT; v_active BOOLEAN; v_n INT;
 BEGIN
   SELECT capacity, is_active INTO v_cap, v_active FROM restaurant_tables WHERE table_id = NEW.table_id;
   IF NOT FOUND THEN RETURN NEW; END IF;                        -- the foreign key reports it
   IF NOT v_active THEN RAISE EXCEPTION 'This table is out of service'; END IF;
   IF NEW.party_size > v_cap THEN RAISE EXCEPTION 'A party of % does not fit this table (seats %)', NEW.party_size, v_cap; END IF;
-  IF TG_OP = 'INSERT' AND NEW.status = 'Booked' AND NEW.start_time < now() THEN
-    RAISE EXCEPTION 'A reservation must start in the future';
+  IF TG_OP = 'INSERT' AND NEW.status = 'Booked' THEN
+    IF NEW.start_time < now() + interval '10 minutes' THEN RAISE EXCEPTION 'A reservation must start at least 10 minutes from now'; END IF;
+    IF NEW.start_time > now() + interval '30 days' THEN RAISE EXCEPTION 'Reservations can be made at most 30 days ahead'; END IF;
+    SELECT COUNT(*) INTO v_n FROM table_reservations WHERE customer_id = NEW.customer_id AND status = 'Booked' AND end_time > now();
+    IF v_n >= 3 THEN RAISE EXCEPTION 'You already have 3 upcoming reservations. Cancel one before booking another.'; END IF;
+    IF EXISTS (SELECT 1 FROM table_reservations WHERE customer_id = NEW.customer_id AND status IN ('Booked','Seated')
+                  AND tstzrange(start_time, end_time) && tstzrange(NEW.start_time, NEW.end_time)) THEN
+      RAISE EXCEPTION 'You already have a booking at that time';
+    END IF;
   END IF;
   RETURN NEW;
 END $$;
+DROP TRIGGER IF EXISTS trg_reservation_guard ON table_reservations;
 CREATE TRIGGER trg_reservation_guard BEFORE INSERT OR UPDATE ON table_reservations
   FOR EACH ROW EXECUTE FUNCTION fn_reservation_guard();
 
-CREATE FUNCTION fn_reserve_table(p_customer INT, p_table INT, p_party INT, p_start TIMESTAMPTZ, p_minutes INT DEFAULT 90)
+CREATE OR REPLACE FUNCTION fn_reserve_table(p_customer INT, p_table INT, p_party INT, p_start TIMESTAMPTZ, p_minutes INT DEFAULT 90)
 RETURNS INT LANGUAGE plpgsql AS $$
 DECLARE v_id INT;
 BEGIN
+  PERFORM fn_expire_reservations();
   INSERT INTO table_reservations (customer_id, table_id, party_size, start_time, end_time)
   VALUES (p_customer, p_table, p_party, p_start, p_start + make_interval(mins => p_minutes))
   RETURNING reservation_id INTO v_id;
@@ -347,7 +369,7 @@ EXCEPTION
   WHEN check_violation      THEN RAISE EXCEPTION 'Invalid reservation time (a booking can last at most 3 hours)';
 END $$;
 
-CREATE FUNCTION fn_available_tables(p_start TIMESTAMPTZ, p_end TIMESTAMPTZ, p_party INT)
+CREATE OR REPLACE FUNCTION fn_available_tables(p_start TIMESTAMPTZ, p_end TIMESTAMPTZ, p_party INT)
 RETURNS TABLE (table_id INT, table_no TEXT, capacity INT, area TEXT) LANGUAGE sql STABLE AS $$
   SELECT t.table_id, t.table_no::text, t.capacity::int, t.area::text FROM restaurant_tables t
    WHERE t.is_active AND t.capacity >= p_party
@@ -361,19 +383,20 @@ $$;
 -- 2.9  FEATURE D: low stock.
 --      The trigger keeps is_sold_out = (stock_qty = 0), also when an admin restocks.
 -- ---------------------------------------------------------------------
-CREATE FUNCTION fn_menu_soldout() RETURNS trigger LANGUAGE plpgsql AS $$
+CREATE OR REPLACE FUNCTION fn_menu_soldout() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN NEW.is_sold_out := (NEW.stock_qty = 0); RETURN NEW; END $$;
+DROP TRIGGER IF EXISTS trg_menu_soldout ON menu_items;
 CREATE TRIGGER trg_menu_soldout BEFORE INSERT OR UPDATE OF stock_qty ON menu_items
   FOR EACH ROW EXECUTE FUNCTION fn_menu_soldout();
 
-CREATE VIEW v_low_stock AS
+CREATE OR REPLACE VIEW v_low_stock AS
 SELECT m.item_id, m.name, c.name AS category, m.stock_qty, m.reorder_level, m.is_sold_out
   FROM menu_items m JOIN categories c USING (category_id)
  WHERE m.is_active AND m.stock_qty <= m.reorder_level
  ORDER BY m.stock_qty, m.name;
 
 -- Implicit cursor: FOUND after UPDATE ... RETURNING
-CREATE FUNCTION fn_restock(p_item INT, p_qty INT) RETURNS INT LANGUAGE plpgsql AS $$
+CREATE OR REPLACE FUNCTION fn_restock(p_item INT, p_qty INT) RETURNS INT LANGUAGE plpgsql AS $$
 DECLARE v_new INT;
 BEGIN
   IF p_qty IS NULL OR p_qty <= 0 THEN RAISE EXCEPTION 'Restock quantity must be above 0'; END IF;
@@ -383,7 +406,7 @@ BEGIN
 END $$;
 
 -- Implicit cursor: FOR ... IN SELECT loop + GET DIAGNOSTICS ROW_COUNT.  Returns items topped up.
-CREATE FUNCTION fn_restock_low_items(p_target INT DEFAULT 50) RETURNS INT LANGUAGE plpgsql AS $$
+CREATE OR REPLACE FUNCTION fn_restock_low_items(p_target INT DEFAULT 50) RETURNS INT LANGUAGE plpgsql AS $$
 DECLARE r RECORD; v_n INT; v_count INT := 0;
 BEGIN
   FOR r IN SELECT item_id FROM v_low_stock ORDER BY item_id LOOP
@@ -398,7 +421,7 @@ END $$;
 -- 2.10  FEATURE E: bill split.  A DEFERRED constraint trigger: you may insert the
 --       shares one by one; the sum is checked when the transaction commits.
 -- ---------------------------------------------------------------------
-CREATE FUNCTION fn_check_split_sum() RETURNS trigger LANGUAGE plpgsql AS $$
+CREATE OR REPLACE FUNCTION fn_check_split_sum() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE v_order INT; v_n INT; v_sum NUMERIC; v_total NUMERIC;
 BEGIN
   v_order := CASE WHEN TG_OP = 'DELETE' THEN OLD.order_id ELSE NEW.order_id END;
@@ -409,6 +432,7 @@ BEGIN
   END IF;
   RETURN NULL;
 END $$;
+DROP TRIGGER IF EXISTS trg_split_sum ON order_splits;
 CREATE CONSTRAINT TRIGGER trg_split_sum AFTER INSERT OR UPDATE OR DELETE ON order_splits
   DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION fn_check_split_sum();
 
@@ -416,10 +440,10 @@ CREATE CONSTRAINT TRIGGER trg_split_sum AFTER INSERT OR UPDATE OR DELETE ON orde
 -- 2.11  Views.  "Synonym-equivalent": PostgreSQL has no CREATE SYNONYM, so a
 --       view (or the search_path) gives the same effect.
 -- ---------------------------------------------------------------------
-CREATE VIEW dishes AS SELECT * FROM menu_items;                  -- synonym for menu_items
+CREATE OR REPLACE VIEW dishes AS SELECT * FROM menu_items;                  -- synonym for menu_items
 
 -- FEATURE A: kitchen display
-CREATE VIEW v_kitchen_queue AS
+CREATE OR REPLACE VIEW v_kitchen_queue AS
 SELECT o.order_id, o.order_no, COALESCE(t.table_no, 'Takeaway') AS table_no, o.order_type, o.status,
        o.created_at,
        (EXTRACT(EPOCH FROM now() - o.created_at) / 60)::int AS minutes_waiting,
@@ -435,14 +459,14 @@ SELECT o.order_id, o.order_no, COALESCE(t.table_no, 'Takeaway') AS table_no, o.o
  ORDER BY o.created_at;
 
 -- FEATURE H: average rating per dish (dishes with no review show 0 reviews)
-CREATE VIEW v_dish_ratings AS
+CREATE OR REPLACE VIEW v_dish_ratings AS
 SELECT m.item_id, m.name, COUNT(r.review_id) AS review_count,
        ROUND(AVG(r.rating), 2) AS avg_rating
   FROM menu_items m LEFT JOIN reviews r ON r.item_id = m.item_id
  GROUP BY m.item_id, m.name;
 
 -- FEATURE F: reports.  Sales are counted on the day the order was closed (updated_at).
-CREATE VIEW v_sales_last_7_days AS
+CREATE OR REPLACE VIEW v_sales_last_7_days AS
 SELECT d::date AS sale_date, COUNT(o.order_id) AS orders,
        COALESCE(SUM(o.subtotal), 0)     AS gross_sales,
        COALESCE(SUM(o.discount_amt), 0) AS discounts,
@@ -452,17 +476,17 @@ SELECT d::date AS sale_date, COUNT(o.order_id) AS orders,
   LEFT JOIN orders o ON o.status = 'Paid' AND o.updated_at::date = d::date
  GROUP BY d ORDER BY d;
 
-CREATE VIEW v_top_dishes AS
+CREATE OR REPLACE VIEW v_top_dishes AS
 SELECT m.name, SUM(oi.quantity) AS units_sold, SUM(oi.line_total) AS revenue
   FROM order_items oi JOIN orders o ON o.order_id = oi.order_id AND o.status = 'Paid'
   JOIN menu_items m ON m.item_id = oi.item_id
  GROUP BY m.name ORDER BY units_sold DESC, revenue DESC LIMIT 10;
 
-CREATE VIEW v_peak_hours AS
+CREATE OR REPLACE VIEW v_peak_hours AS
 SELECT EXTRACT(HOUR FROM created_at)::int AS hour_of_day, COUNT(*) AS orders, SUM(total_amt) AS net_sales
   FROM orders WHERE status = 'Paid' GROUP BY 1 ORDER BY orders DESC, hour_of_day;
 
-CREATE VIEW v_restaurant_summary AS
+CREATE OR REPLACE VIEW v_restaurant_summary AS
 SELECT (SELECT COUNT(*) FROM customers)                                         AS customers,
        (SELECT COUNT(*) FROM orders WHERE status = 'Paid')                      AS paid_orders,
        (SELECT COALESCE(SUM(total_amt), 0) FROM orders WHERE status = 'Paid')   AS revenue,
@@ -472,7 +496,7 @@ SELECT (SELECT COUNT(*) FROM customers)                                         
        (SELECT ROUND(AVG(rating), 2) FROM reviews)                              AS avg_rating;
 
 -- FEATURE G: order history and audit trail
-CREATE VIEW v_order_history AS
+CREATE OR REPLACE VIEW v_order_history AS
 SELECT o.order_id, o.order_no, o.customer_id, o.order_type, COALESCE(t.table_no, '-') AS table_no, o.status,
        o.subtotal, o.discount_amt, o.tax_amt, o.total_amt, o.created_at,
        string_agg(oi.quantity || ' x ' || m.name, ', ' ORDER BY oi.line_no) AS items
@@ -482,7 +506,7 @@ SELECT o.order_id, o.order_no, o.customer_id, o.order_type, COALESCE(t.table_no,
   LEFT JOIN menu_items m   ON m.item_id = oi.item_id
  GROUP BY o.order_id, t.table_no;
 
-CREATE VIEW v_order_audit AS
+CREATE OR REPLACE VIEW v_order_audit AS
 SELECT record_id AS order_id, old_data ->> 'status' AS from_status, new_data ->> 'status' AS to_status,
        changed_by, changed_at
   FROM audit_log WHERE table_name = 'orders' AND action = 'STATUS' ORDER BY changed_at, audit_id;
@@ -493,7 +517,7 @@ SELECT record_id AS order_id, old_data ->> 'status' AS from_status, new_data ->>
 --       the dates travel as bind parameters ($1, $2), so there is no SQL injection.
 --       Usage: SELECT * FROM fn_sales_by('category', current_date - 7, current_date);
 -- ---------------------------------------------------------------------
-CREATE FUNCTION fn_sales_by(p_dimension TEXT, p_from DATE, p_to DATE)
+CREATE OR REPLACE FUNCTION fn_sales_by(p_dimension TEXT, p_from DATE, p_to DATE)
 RETURNS TABLE (bucket TEXT, order_count BIGINT, sales_amount NUMERIC) LANGUAGE plpgsql AS $$
 DECLARE v_key TEXT; v_measure TEXT := 'SUM(o.total_amt)'; v_from TEXT := 'orders o'; v_sql TEXT;
 BEGIN
@@ -521,7 +545,7 @@ END $$;
 --       Result is upserted into daily_settlement (safe to re-run).
 --       Usage: CALL sp_daily_settlement(current_date - 1);
 -- ---------------------------------------------------------------------
-CREATE PROCEDURE sp_daily_settlement(p_date DATE) LANGUAGE plpgsql AS $$
+CREATE OR REPLACE PROCEDURE sp_daily_settlement(p_date DATE) LANGUAGE plpgsql AS $$
 DECLARE
   c_orders CURSOR FOR
     SELECT order_id, subtotal, discount_amt, tax_amt, total_amt FROM orders
@@ -565,6 +589,112 @@ BEGIN
 EXCEPTION WHEN OTHERS THEN
   RAISE EXCEPTION 'Settlement for % failed: %', p_date, SQLERRM;
 END $$;
+
+
+
+-- ---------------------------------------------------------------------
+-- 2.15  Reservation life cycle and table choice for a customer
+--       fn_expire_reservations : Booked 15 minutes after its end with no order -> No-show;
+--                                Seated whose order is Paid or Cancelled -> Completed.
+--                                (Called lazily by the API and by fn_reserve_table, so no scheduler is needed.)
+--       fn_tables_for_customer : tables without a live order, each flagged for THIS customer:
+--                                'mine' (their own booking is usable now), 'reserved' (another guest booked it
+--                                within 90 minutes) or 'free'.
+-- ---------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION fn_expire_reservations() RETURNS INT LANGUAGE plpgsql AS $$
+DECLARE v_n INT := 0; v_k INT;
+BEGIN
+  UPDATE table_reservations SET status = 'No-show'
+   WHERE status = 'Booked' AND end_time < now() - interval '15 minutes';
+  GET DIAGNOSTICS v_k = ROW_COUNT; v_n := v_n + v_k;
+  UPDATE table_reservations r SET status = 'Completed'
+   WHERE r.status = 'Seated' AND EXISTS (SELECT 1 FROM orders o WHERE o.reservation_id = r.reservation_id AND o.status IN ('Paid','Cancelled'));
+  GET DIAGNOSTICS v_k = ROW_COUNT; v_n := v_n + v_k;
+  RETURN v_n;
+END $$;
+
+CREATE OR REPLACE FUNCTION fn_tables_for_customer(p_customer INT)
+RETURNS TABLE (table_id INT, no TEXT, capacity INT, area TEXT, state TEXT, reservation_id INT, booking_start TIMESTAMPTZ)
+LANGUAGE plpgsql AS $$
+BEGIN
+  PERFORM fn_expire_reservations();
+  RETURN QUERY
+  SELECT t.table_id, t.table_no::text, t.capacity::int, t.area::text,
+         (CASE WHEN mine.reservation_id IS NOT NULL THEN 'mine' WHEN other.reservation_id IS NOT NULL THEN 'reserved' ELSE 'free' END)::text,
+         mine.reservation_id, COALESCE(mine.start_time, other.start_time)
+    FROM restaurant_tables t
+    LEFT JOIN LATERAL (SELECT r.reservation_id, r.start_time FROM table_reservations r
+                        WHERE r.table_id = t.table_id AND r.customer_id = p_customer AND r.status = 'Booked'
+                          AND r.start_time - interval '30 minutes' <= now() AND r.end_time > now() ORDER BY r.start_time LIMIT 1) mine ON TRUE
+    LEFT JOIN LATERAL (SELECT r.reservation_id, r.start_time FROM table_reservations r
+                        WHERE r.table_id = t.table_id AND r.customer_id <> p_customer AND r.status = 'Booked'
+                          AND tstzrange(r.start_time, r.end_time) && tstzrange(now(), now() + interval '90 minutes') ORDER BY r.start_time LIMIT 1) other ON TRUE
+   WHERE t.is_active AND NOT EXISTS (SELECT 1 FROM orders o WHERE o.table_id = t.table_id AND o.status NOT IN ('Paid','Cancelled'))
+   ORDER BY t.table_no;
+END $$;
+
+-- ---------------------------------------------------------------------
+-- 2.16  Admin menu management: add a category, add a dish, hide or show a dish.
+--       Only the admin (or a psql session acting as 'system') may call them; 08_security.sql also
+--       limits EXECUTE to df_admin.  Dishes that already have orders are hidden, never deleted.
+-- ---------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION fn_add_category(p_name TEXT) RETURNS INT LANGUAGE plpgsql AS $$
+DECLARE v_id INT;
+BEGIN
+  IF fn_ctx_role() NOT IN ('admin','system') THEN RAISE EXCEPTION 'Only the administrator can change the menu'; END IF;
+  p_name := trim(p_name);
+  IF p_name IS NULL OR length(p_name) < 2 OR length(p_name) > 40 THEN RAISE EXCEPTION 'A category name needs 2 to 40 characters'; END IF;
+  INSERT INTO categories (name, display_order) VALUES (p_name, COALESCE((SELECT MAX(display_order) FROM categories), 0) + 1)
+  RETURNING category_id INTO v_id;
+  RETURN v_id;
+EXCEPTION WHEN unique_violation THEN RAISE EXCEPTION 'That category already exists';
+END $$;
+
+CREATE OR REPLACE FUNCTION fn_add_menu_item(p_category INT, p_name TEXT, p_price NUMERIC, p_veg BOOLEAN, p_stock INT,
+                                            p_description TEXT DEFAULT NULL, p_reorder INT DEFAULT 10) RETURNS INT
+LANGUAGE plpgsql AS $$
+DECLARE v_id INT;
+BEGIN
+  IF fn_ctx_role() NOT IN ('admin','system') THEN RAISE EXCEPTION 'Only the administrator can change the menu'; END IF;
+  p_name := trim(p_name);
+  IF p_name IS NULL OR length(p_name) < 2 OR length(p_name) > 80 THEN RAISE EXCEPTION 'A dish name needs 2 to 80 characters'; END IF;
+  IF p_price IS NULL OR p_price <= 0 OR p_price > 100000 THEN RAISE EXCEPTION 'The price must be above 0 and at most 100000'; END IF;
+  IF p_stock IS NULL OR p_stock < 0 OR p_stock > 100000 THEN RAISE EXCEPTION 'The opening stock must be between 0 and 100000'; END IF;
+  IF p_reorder IS NULL OR p_reorder < 0 THEN RAISE EXCEPTION 'The reorder level cannot be negative'; END IF;
+  INSERT INTO menu_items (category_id, name, description, price, is_veg, stock_qty, reorder_level)
+  VALUES (p_category, p_name, left(trim(p_description), 200), p_price, COALESCE(p_veg, TRUE), p_stock, p_reorder)
+  RETURNING item_id INTO v_id;
+  RETURN v_id;
+EXCEPTION
+  WHEN unique_violation      THEN RAISE EXCEPTION 'A dish with this name already exists';
+  WHEN foreign_key_violation THEN RAISE EXCEPTION 'Unknown category';
+END $$;
+
+CREATE OR REPLACE FUNCTION fn_set_item_active(p_item INT, p_active BOOLEAN) RETURNS VOID LANGUAGE plpgsql AS $$
+BEGIN
+  IF fn_ctx_role() NOT IN ('admin','system') THEN RAISE EXCEPTION 'Only the administrator can change the menu'; END IF;
+  UPDATE menu_items SET is_active = p_active WHERE item_id = p_item;
+  IF NOT FOUND THEN RAISE EXCEPTION 'Menu item % does not exist', p_item; END IF;
+END $$;
+
+-- ---------------------------------------------------------------------
+-- 2.14  FEATURE: live floor map. One row per active table with its state:
+--       Occupied (a live order, with its status), Reserved (booking starts within 60 minutes or is seated), Free.
+-- ---------------------------------------------------------------------
+CREATE OR REPLACE VIEW v_floor_map AS
+SELECT t.table_id, t.table_no, t.capacity, t.area,
+       CASE WHEN o.order_id IS NOT NULL THEN 'Occupied' WHEN r.reservation_id IS NOT NULL THEN 'Reserved' ELSE 'Free' END AS state,
+       o.order_no, o.status AS order_status,
+       (EXTRACT(EPOCH FROM now() - o.created_at) / 60)::int AS minutes_seated,
+       r.start_time AS booking_start, r.party_size AS booking_party
+  FROM restaurant_tables t
+  LEFT JOIN LATERAL (SELECT order_id, order_no, status, created_at FROM orders
+                      WHERE table_id = t.table_id AND status NOT IN ('Paid','Cancelled') LIMIT 1) o ON TRUE
+  LEFT JOIN LATERAL (SELECT reservation_id, start_time, party_size FROM table_reservations
+                      WHERE table_id = t.table_id AND status IN ('Booked','Seated') AND end_time > now()
+                        AND start_time <= now() + interval '60 minutes' ORDER BY start_time LIMIT 1) r ON TRUE
+ WHERE t.is_active
+ ORDER BY t.table_no;
 
 -- Self-check (capture for the report): objects created by this file
 SELECT 'triggers' AS kind, COUNT(*) AS n FROM information_schema.triggers WHERE trigger_schema = 'dineflow'

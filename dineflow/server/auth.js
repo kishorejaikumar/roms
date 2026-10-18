@@ -6,8 +6,14 @@ if (SECRET.length < 16) { console.error('TOKEN_SECRET must be set to a long rand
 const b64 = (b) => Buffer.from(b).toString('base64url');
 const sign = (data) => crypto.createHmac('sha256', SECRET).update(data).digest('base64url');
 
-function makeToken(user, ttlSeconds = 8 * 3600) {
-  const payload = b64(JSON.stringify({ id: user.id, role: user.role, name: user.name, exp: Math.floor(Date.now() / 1000) + ttlSeconds }));
+// Session length (absolute limit, enforced by the server): customers 60 minutes, staff 30 minutes by default.
+// Change with SESSION_MINUTES_CUSTOMER and SESSION_MINUTES_STAFF in .env.  (The browser also signs out after 15 idle minutes.)
+const minutesFromEnv = (name, fallback) => { const n = Number(process.env[name]); return Number.isFinite(n) && n > 0 ? n : fallback; };
+const sessionSeconds = (role) => 60 * (role === 'customer' ? minutesFromEnv('SESSION_MINUTES_CUSTOMER', 60) : minutesFromEnv('SESSION_MINUTES_STAFF', 30));
+
+function makeToken(user, ttlSeconds = sessionSeconds(user.role)) {
+  const now = Math.floor(Date.now() / 1000);
+  const payload = b64(JSON.stringify({ id: user.id, role: user.role, name: user.name, iat: now, exp: now + ttlSeconds }));
   return `${payload}.${sign(payload)}`;
 }
 function readToken(token) {
@@ -47,4 +53,4 @@ function limiter(req, res, next) {
 }
 setInterval(() => { const t = Date.now(); for (const [k, v] of fails) if (t - v.first > WINDOW) fails.delete(k); }, 60000).unref();
 
-module.exports = { makeToken, readToken, authenticate, requireRole, limiter };
+module.exports = { sessionSeconds, makeToken, readToken, authenticate, requireRole, limiter };

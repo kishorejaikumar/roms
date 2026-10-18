@@ -12,7 +12,7 @@ DECLARE
   names TEXT[] := '{}'; units TEXT[] := '{}'; oks BOOLEAN[] := '{}';
   v_ok BOOLEAN; v_n NUMERIC; v_i INT; v_o INT; v_o2 INT; v_pid INT; v_stock INT; v_stock2 INT;
   v_cust INT; v_c2 INT; v_rasmalai INT; v_corn INT; v_paneer INT; v_chai INT; v_biryani INT; v_gulab INT;
-  v_t1 INT; v_t2 INT; v_t4 INT; v_msg TEXT; v_used INT;
+  v_t1 INT; v_t2 INT; v_t4 INT; v_msg TEXT; v_used INT; v_x INT; v_y INT; v_t6 INT; v_t7 INT; v_t9 INT; v_cat INT; v_dish INT;
 BEGIN
   BEGIN   -- sub-transaction: everything inside is undone at the end
     SELECT item_id INTO v_rasmalai FROM menu_items WHERE name = 'Rasmalai';
@@ -284,6 +284,86 @@ BEGIN
       INSERT INTO order_splits (order_id, split_no, payer_name, amount) VALUES (10, 1, 'A', 100), (10, 2, 'B', 100);
       SET CONSTRAINTS trg_split_sum IMMEDIATE;
     EXCEPTION WHEN OTHERS THEN v_ok := (SQLERRM LIKE 'Split amounts%'); END;
+    oks := oks || v_ok;
+
+
+    -- ===== reservations: limits, clean-up and automatic seating =====
+    SELECT table_id INTO v_t6 FROM restaurant_tables WHERE table_no = 'T06';
+    SELECT table_id INTO v_t7 FROM restaurant_tables WHERE table_no = 'T07';
+    SELECT table_id INTO v_t9 FROM restaurant_tables WHERE table_no = 'T09';
+
+    names := names || 'Reservation: a booking starting in less than 10 minutes is rejected'::text; units := units || 'II'::text;
+    v_ok := FALSE; BEGIN PERFORM fn_reserve_table(5, v_t6, 2, now() + interval '2 minutes', 60); EXCEPTION WHEN OTHERS THEN v_ok := (SQLERRM LIKE '%at least 10 minutes%'); END;
+    oks := oks || v_ok;
+
+    names := names || 'Reservation: a booking more than 30 days ahead is rejected'::text; units := units || 'II'::text;
+    v_ok := FALSE; BEGIN PERFORM fn_reserve_table(5, v_t6, 2, now() + interval '40 days', 60); EXCEPTION WHEN OTHERS THEN v_ok := (SQLERRM LIKE '%30 days%'); END;
+    oks := oks || v_ok;
+
+    names := names || 'Reservation: one customer cannot hold two bookings at the same time'::text; units := units || 'II'::text;
+    PERFORM fn_reserve_table(5, v_t6, 2, date_trunc('day', now()) + interval '3 days 19 hours', 60);
+    v_ok := FALSE; BEGIN PERFORM fn_reserve_table(5, v_t7, 2, date_trunc('day', now()) + interval '3 days 19 hours 15 minutes', 60); EXCEPTION WHEN OTHERS THEN v_ok := (SQLERRM LIKE '%already have a booking at that time%'); END;
+    oks := oks || v_ok;
+
+    names := names || 'Reservation: at most 3 upcoming bookings per customer'::text; units := units || 'II'::text;
+    PERFORM fn_reserve_table(5, v_t6, 2, date_trunc('day', now()) + interval '4 days 19 hours', 60);
+    PERFORM fn_reserve_table(5, v_t6, 2, date_trunc('day', now()) + interval '5 days 19 hours', 60);
+    v_ok := FALSE; BEGIN PERFORM fn_reserve_table(5, v_t6, 2, date_trunc('day', now()) + interval '6 days 19 hours', 60); EXCEPTION WHEN OTHERS THEN v_ok := (SQLERRM LIKE '%3 upcoming reservations%'); END;
+    oks := oks || v_ok;
+
+    names := names || 'Reservation: fn_expire_reservations marks an old Booked row as No-show'::text; units := units || 'II'::text;
+    INSERT INTO table_reservations (customer_id, table_id, party_size, start_time, end_time, status)
+    VALUES (4, v_t7, 2, now() - interval '3 hours', now() - interval '90 minutes', 'Cancelled') RETURNING reservation_id INTO v_x;
+    UPDATE table_reservations SET status = 'Booked' WHERE reservation_id = v_x;
+    PERFORM fn_expire_reservations();
+    oks := oks || ((SELECT status FROM table_reservations WHERE reservation_id = v_x) = 'No-show');
+
+    -- a booking by customer 4 on T09 that can be used right now (created as Cancelled, then switched, to pass the 10-minute rule)
+    INSERT INTO table_reservations (customer_id, table_id, party_size, start_time, end_time, status)
+    VALUES (4, v_t9, 2, now() + interval '5 minutes', now() + interval '95 minutes', 'Cancelled') RETURNING reservation_id INTO v_y;
+    UPDATE table_reservations SET status = 'Booked' WHERE reservation_id = v_y;
+
+    names := names || 'Reservation: fn_tables_for_customer shows T09 as "mine" for the owner and "reserved" for others'::text; units := units || 'II'::text;
+    oks := oks || ((SELECT state FROM fn_tables_for_customer(4) WHERE table_id = v_t9) = 'mine'
+                   AND (SELECT reservation_id FROM fn_tables_for_customer(4) WHERE table_id = v_t9) = v_y
+                   AND (SELECT state FROM fn_tables_for_customer(2) WHERE table_id = v_t9) = 'reserved');
+
+    names := names || 'Reservation: another guest cannot order on a table reserved within 90 minutes'::text; units := units || 'IV'::text;
+    v_ok := FALSE; BEGIN PERFORM fn_place_order(2, 'Dine-in', v_t9, jsonb_build_array(jsonb_build_object('itemId', v_chai, 'qty', 1))); EXCEPTION WHEN OTHERS THEN v_ok := (SQLERRM LIKE '%reserved by another guest%'); END;
+    oks := oks || v_ok;
+
+    names := names || 'Reservation: the owner''s order seats the booking automatically and links it to the order'::text; units := units || 'IV'::text;
+    v_x := fn_place_order(4, 'Dine-in', v_t9, jsonb_build_array(jsonb_build_object('itemId', v_chai, 'qty', 1)));
+    oks := oks || ((SELECT status FROM table_reservations WHERE reservation_id = v_y) = 'Seated'
+                   AND (SELECT reservation_id FROM orders WHERE order_id = v_x) = v_y);
+
+    -- ===== admin menu management =====
+    names := names || 'Admin menu: fn_add_category adds a category and rejects a duplicate'::text; units := units || 'II'::text;
+    v_cat := fn_add_category('Soups');
+    v_ok := FALSE; BEGIN PERFORM fn_add_category('soups'); PERFORM fn_add_category('Soups'); EXCEPTION WHEN OTHERS THEN v_ok := (SQLERRM LIKE '%already exists%'); END;
+    oks := oks || (v_cat IS NOT NULL AND EXISTS (SELECT 1 FROM categories WHERE name = 'Soups') AND v_ok);
+
+    names := names || 'Admin menu: fn_add_menu_item adds a dish; duplicate name, price 0 and unknown category are rejected'::text; units := units || 'II'::text;
+    v_dish := fn_add_menu_item(v_cat, 'Tomato Soup', 120, TRUE, 30, 'Hot tomato soup');
+    v_ok := FALSE; BEGIN PERFORM fn_add_menu_item(v_cat, 'Tomato Soup', 120, TRUE, 30); EXCEPTION WHEN OTHERS THEN v_ok := (SQLERRM LIKE '%already exists%'); END;
+    v_i := 0;
+    BEGIN PERFORM fn_add_menu_item(v_cat, 'Free Soup', 0, TRUE, 30); EXCEPTION WHEN OTHERS THEN IF SQLERRM LIKE '%price must be above 0%' THEN v_i := v_i + 1; END IF; END;
+    BEGIN PERFORM fn_add_menu_item(99999, 'Ghost Soup', 50, TRUE, 30); EXCEPTION WHEN OTHERS THEN IF SQLERRM LIKE '%Unknown category%' THEN v_i := v_i + 1; END IF; END;
+    oks := oks || (v_dish IS NOT NULL AND (SELECT stock_qty FROM menu_items WHERE item_id = v_dish) = 30 AND v_ok AND v_i = 2);
+
+    names := names || 'Admin menu: a dish added with opening stock 0 is marked sold out'::text; units := units || 'II'::text;
+    v_x := fn_add_menu_item(v_cat, 'Seasonal Soup', 150, FALSE, 0);
+    oks := oks || (SELECT is_sold_out FROM menu_items WHERE item_id = v_x);
+
+    names := names || 'Admin menu: a hidden dish (fn_set_item_active) can no longer be ordered'::text; units := units || 'II'::text;
+    PERFORM fn_set_item_active(v_dish, FALSE);
+    v_ok := FALSE; BEGIN PERFORM fn_place_order(1, 'Takeaway', NULL, jsonb_build_array(jsonb_build_object('itemId', v_dish, 'qty', 1))); EXCEPTION WHEN OTHERS THEN v_ok := (SQLERRM LIKE '%not available%'); END;
+    oks := oks || v_ok;
+
+    names := names || 'Admin menu: the customer role cannot add a dish (role check inside the function)'::text; units := units || 'II'::text;
+    PERFORM set_config('dineflow.role', 'customer', true);
+    v_ok := FALSE; BEGIN PERFORM fn_add_menu_item(v_cat, 'Sneaky Soup', 50, TRUE, 5); EXCEPTION WHEN OTHERS THEN v_ok := (SQLERRM LIKE 'Only the administrator%'); END;
+    PERFORM set_config('dineflow.role', '', true);
     oks := oks || v_ok;
 
     RAISE EXCEPTION 'rollback tests' USING ERRCODE = 'RB001';

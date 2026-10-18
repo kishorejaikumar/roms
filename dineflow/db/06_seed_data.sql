@@ -1,12 +1,17 @@
 -- =====================================================================
--- DineFlow | Realistic seed data.  Run AFTER 01 and 03 (and 04 if you want place_order available).
--- The seed goes through the REAL triggers: totals are computed by the totals trigger,
--- statuses move along status_flow, payments close bills, the cancel trigger returns stock.
+-- DineFlow | Realistic seed data.  Run AFTER 01 and 03 (and 04a).
+-- RE-RUNNABLE: step 0 clears the old demo data first, so you never get "duplicate key".
+-- The whole file is ONE transaction (BEGIN ... COMMIT): if anything fails, nothing is kept.
+-- SET LOCAL keeps the search_path and admin role for the whole transaction.
 -- Demo logins:  admin@dineflow.in / Admin@123   kitchen1@dineflow.in / Kitchen@123
 --               asha.rao@example.in / Customer@123 (all customers use Customer@123)
 -- =====================================================================
-SET search_path = dineflow, public, extensions;
-SELECT set_config('dineflow.role', 'admin', false);       -- seed acts as admin for the whole session
+BEGIN;
+SET LOCAL search_path = dineflow, public, extensions;
+SELECT set_config('dineflow.role', 'admin', true);        -- seed acts as admin for this transaction
+
+-- ---------- 0. Clear previous demo data (tables, functions and views stay) ----------
+TRUNCATE staff, customers, restaurant_tables, categories, coupons RESTART IDENTITY CASCADE;
 
 -- ---------- Staff (bcrypt hashes made by the database) ----------------
 INSERT INTO staff (full_name, email, password_hash, role) VALUES
@@ -72,6 +77,7 @@ INSERT INTO table_reservations (customer_id, table_id, party_size, start_time, e
            date_trunc('day', now()) - interval '6 days' + interval '14 hours 30 minutes', 'Completed');
 SELECT fn_reserve_table(2, 4, 4, date_trunc('day', now()) + interval '1 day 20 hours', 90);
 SELECT fn_reserve_table(3, 8, 6, date_trunc('day', now()) + interval '2 days 13 hours', 120);
+SELECT fn_reserve_table(6, 5, 3, now() + interval '40 minutes', 90);       -- shows T05 as Reserved on the live floor map
 
 -- ---------- 12 orders.  All start as Placed (distinct tables, so the one-live-order rule holds)
 INSERT INTO orders (order_id, customer_id, table_id, reservation_id, coupon_id, order_type) OVERRIDING SYSTEM VALUE VALUES
@@ -164,13 +170,15 @@ UPDATE menu_items SET stock_qty = 1 WHERE name = 'Rasmalai';          -- demo: o
 UPDATE menu_items SET stock_qty = 9 WHERE name = 'Gulab Jamun';       -- shows in v_low_stock
 UPDATE menu_items SET stock_qty = 0 WHERE name = 'Crispy Corn';       -- trigger marks it sold out
 
-SELECT set_config('dineflow.role', '', false);
+SELECT set_config('dineflow.role', '', true);
 DO $$ BEGIN   -- refresh the reporting materialised view if 02 has been run
   IF to_regclass('dineflow.mv_item_sales_daily') IS NOT NULL THEN REFRESH MATERIALIZED VIEW dineflow.mv_item_sales_daily; END IF;
 END $$;
 CALL sp_daily_settlement(current_date - 1);
 CALL sp_daily_settlement(current_date - 2);
+COMMIT;
 
-SELECT 'customers' AS what, COUNT(*) FROM customers UNION ALL SELECT 'menu_items', COUNT(*) FROM menu_items
-UNION ALL SELECT 'orders', COUNT(*) FROM orders UNION ALL SELECT 'paid orders', COUNT(*) FROM orders WHERE status='Paid'
-UNION ALL SELECT 'payments', COUNT(*) FROM payments UNION ALL SELECT 'audit rows', COUNT(*) FROM audit_log;
+-- Check (a complete seed shows: customers 6, menu_items 19, orders 12, paid orders 8, payments 9)
+SELECT 'customers' AS what, COUNT(*) FROM dineflow.customers UNION ALL SELECT 'menu_items', COUNT(*) FROM dineflow.menu_items
+UNION ALL SELECT 'orders', COUNT(*) FROM dineflow.orders UNION ALL SELECT 'paid orders', COUNT(*) FROM dineflow.orders WHERE status='Paid'
+UNION ALL SELECT 'payments', COUNT(*) FROM dineflow.payments UNION ALL SELECT 'audit rows', COUNT(*) FROM dineflow.audit_log;

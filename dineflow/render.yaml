@@ -3,9 +3,8 @@ services:
   - type: web
     name: dineflow
     runtime: node
-    rootDir: server
-    buildCommand: npm install
-    startCommand: npm start
+    buildCommand: cd server && npm install
+    startCommand: cd server && npm start
     healthCheckPath: /api/health
     envVars:
       - key: DATABASE_URL

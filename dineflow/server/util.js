@@ -7,12 +7,13 @@ const wrap = (fn) => (req, res, next) => fn(req, res, next).catch((e) => {
     case '23505': status = 409; msg = 'That already exists or the table is busy'; break;     // unique violation
     case '23514': status = 400; msg = 'A value is outside the allowed range'; break;         // CHECK
     case '23503': status = 400; msg = 'Unknown reference'; break;                             // foreign key
+    case '42501': status = 403; msg = 'You are not allowed to do this'; break;               // GRANT / row-level security refused it
     case '22P02': case '22003': case '22007': case '22008': status = 400; msg = 'Invalid input'; break;
     case '55P03': status = 409; msg = 'Someone else is working on this right now. Try again.'; break;
     case '40001': case '40P01': status = 503; msg = 'The system was busy. Please try again.'; break;
   }
   if (!msg) { status = 500; msg = 'Server error'; }
-  if (status === 500) console.error(e);
+  if (status === 500) { console.error(e); if (process.env.DEBUG_ERRORS === 'on') msg = `Server error [${e.code || 'no code'}]: ${e.message}`; }   // DEBUG_ERRORS=on only while fixing a problem
   res.status(status).json({ error: msg });
 });
 const bad = (message, status = 400) => Object.assign(new Error(message), { status });

@@ -1,6 +1,7 @@
 -- =====================================================================
 -- DineFlow | UNIT IV : Transactions, ACID, locking, savepoints, isolation levels
 -- Run after 01 and 03.   psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/04_transactions.sql
+-- PART A: functions only. Run this FIRST, alone. Then run 04b (demo) as a separate query.
 -- =====================================================================
 SET search_path = dineflow, public, extensions;
 
@@ -15,7 +16,7 @@ SET search_path = dineflow, public, extensions;
 --   UPI/Card are "paid" at once by a simulated gateway (UPI id starting FAIL, or card 0000, is declined);
 --   Cash stays Pending until staff confirm it with fn_confirm_payment().
 -- ---------------------------------------------------------------------
-CREATE FUNCTION fn_place_order(
+CREATE OR REPLACE FUNCTION fn_place_order(
   p_customer INT, p_order_type order_type, p_table_id INT, p_items JSONB,
   p_coupon_code TEXT DEFAULT NULL, p_reservation_id INT DEFAULT NULL,
   p_method payment_method DEFAULT 'Cash', p_upi_ref TEXT DEFAULT NULL, p_card_last4 TEXT DEFAULT NULL,
@@ -45,10 +46,18 @@ BEGIN
        WHERE reservation_id = p_reservation_id AND customer_id = p_customer AND table_id = p_table_id
          AND status = 'Booked' AND start_time - interval '30 minutes' <= now() AND end_time > now();
       IF NOT FOUND THEN RAISE EXCEPTION 'That reservation is not valid for this table right now'; END IF;
-    ELSIF EXISTS (SELECT 1 FROM table_reservations
-                   WHERE table_id = p_table_id AND status = 'Booked' AND customer_id <> p_customer
-                     AND tstzrange(start_time, end_time) && tstzrange(now(), now() + interval '90 minutes')) THEN
-      RAISE EXCEPTION 'Table % is reserved by another guest around this time', t.table_no;
+    ELSE                                                      -- no id sent: seat the guest's own usable booking automatically
+      UPDATE table_reservations SET status = 'Seated'
+       WHERE reservation_id = (SELECT reservation_id FROM table_reservations
+                                WHERE customer_id = p_customer AND table_id = p_table_id AND status = 'Booked'
+                                  AND start_time - interval '30 minutes' <= now() AND end_time > now()
+                                ORDER BY start_time LIMIT 1 FOR UPDATE)
+      RETURNING reservation_id INTO p_reservation_id;
+      IF p_reservation_id IS NULL AND EXISTS (SELECT 1 FROM table_reservations
+                     WHERE table_id = p_table_id AND status = 'Booked' AND customer_id <> p_customer
+                       AND tstzrange(start_time, end_time) && tstzrange(now(), now() + interval '90 minutes')) THEN
+        RAISE EXCEPTION 'Table % is reserved by another guest around this time', t.table_no;
+      END IF;
     END IF;
   ELSE
     p_table_id := NULL;                                       -- takeaway has no table
@@ -97,7 +106,7 @@ EXCEPTION
 END $$;
 
 -- Shared payment helper: simulated gateway + insert.  UPI/Card -> Success, Cash -> Pending.
-CREATE FUNCTION fn_record_payment(p_order INT, p_method payment_method, p_amount NUMERIC,
+CREATE OR REPLACE FUNCTION fn_record_payment(p_order INT, p_method payment_method, p_amount NUMERIC,
                                   p_upi_ref TEXT, p_card_last4 TEXT) RETURNS INT LANGUAGE plpgsql AS $$
 DECLARE v_id INT;
 BEGIN
@@ -119,7 +128,7 @@ END $$;
 -- 4.2  Paying later, splitting the bill (FEATURE E) and confirming cash.
 --      p_actor = the customer's id from the token (NULL when an admin acts).
 -- ---------------------------------------------------------------------
-CREATE FUNCTION fn_assert_order_payable(p_order INT, p_actor INT, OUT o orders) LANGUAGE plpgsql AS $$
+CREATE OR REPLACE FUNCTION fn_assert_order_payable(p_order INT, p_actor INT, OUT o orders) LANGUAGE plpgsql AS $$
 BEGIN
   SELECT * INTO o FROM orders WHERE order_id = p_order FOR UPDATE;           -- one payer at a time
   IF NOT FOUND THEN RAISE EXCEPTION 'Order % does not exist', p_order; END IF;
@@ -127,7 +136,7 @@ BEGIN
   IF o.status IN ('Paid','Cancelled') THEN RAISE EXCEPTION 'Order is already %', o.status; END IF;
 END $$;
 
-CREATE FUNCTION fn_pay_order(p_order INT, p_actor INT, p_method payment_method, p_upi_ref TEXT DEFAULT NULL, p_card_last4 TEXT DEFAULT NULL)
+CREATE OR REPLACE FUNCTION fn_pay_order(p_order INT, p_actor INT, p_method payment_method, p_upi_ref TEXT DEFAULT NULL, p_card_last4 TEXT DEFAULT NULL)
 RETURNS INT LANGUAGE plpgsql AS $$
 DECLARE o orders; v_paid NUMERIC;
 BEGIN
@@ -139,7 +148,7 @@ BEGIN
   RETURN fn_record_payment(p_order, p_method, o.total_amt - v_paid, p_upi_ref, p_card_last4);
 END $$;
 
-CREATE FUNCTION fn_split_bill(p_order INT, p_actor INT, p_names TEXT[]) RETURNS INT LANGUAGE plpgsql AS $$
+CREATE OR REPLACE FUNCTION fn_split_bill(p_order INT, p_actor INT, p_names TEXT[]) RETURNS INT LANGUAGE plpgsql AS $$
 DECLARE o orders; n INT := COALESCE(array_length(p_names, 1), 0); v_each NUMERIC; i INT;
 BEGIN
   IF n < 2 OR n > 10 THEN RAISE EXCEPTION 'A bill can be split between 2 and 10 diners'; END IF;
@@ -158,7 +167,7 @@ BEGIN
   RETURN n;
 END $$;
 
-CREATE FUNCTION fn_pay_split(p_order INT, p_split_no INT, p_actor INT, p_method payment_method,
+CREATE OR REPLACE FUNCTION fn_pay_split(p_order INT, p_split_no INT, p_actor INT, p_method payment_method,
                              p_upi_ref TEXT DEFAULT NULL, p_card_last4 TEXT DEFAULT NULL) RETURNS INT LANGUAGE plpgsql AS $$
 DECLARE o orders; s order_splits%ROWTYPE; v_pay INT;
 BEGIN
@@ -171,46 +180,11 @@ BEGIN
   RETURN v_pay;
 END $$;
 
-CREATE FUNCTION fn_confirm_payment(p_payment INT) RETURNS VOID LANGUAGE plpgsql AS $$
+CREATE OR REPLACE FUNCTION fn_confirm_payment(p_payment INT) RETURNS VOID LANGUAGE plpgsql AS $$
 BEGIN
   UPDATE payments SET status = 'Success' WHERE payment_id = p_payment AND status = 'Pending';
   IF NOT FOUND THEN RAISE EXCEPTION 'Payment % is not pending', p_payment; END IF;
 END $$;
-
--- ---------------------------------------------------------------------
--- 4.3  Runnable demo (self-cleaning: creates its own rows, then ROLLBACK).
---      Shows BEGIN, SAVEPOINT, ROLLBACK TO SAVEPOINT, failed payment rollback, isolation level.
--- ---------------------------------------------------------------------
-BEGIN;
-  SELECT current_setting('transaction_isolation') AS isolation_level;
-  INSERT INTO customers (customer_id, full_name, email, phone, password_hash) OVERRIDING SYSTEM VALUE
-    VALUES (990001, 'Demo Guest', 'demo.guest@example.in', '9000000001', 'x');
-  INSERT INTO restaurant_tables (table_id, table_no, capacity) OVERRIDING SYSTEM VALUE VALUES (990001, 'D01', 4);
-  INSERT INTO categories (category_id, name) OVERRIDING SYSTEM VALUE VALUES (990001, 'Demo');
-  INSERT INTO menu_items (item_id, category_id, name, price, stock_qty) OVERRIDING SYSTEM VALUE
-    VALUES (990001, 990001, 'Demo Thali', 200, 5);
-
-  SAVEPOINT before_order;
-  SELECT fn_place_order(990001, 'Dine-in', 990001, '[{"itemId":990001,"qty":2}]', NULL, NULL, 'Cash') AS new_order_id;
-  SELECT 'after order' AS step, stock_qty FROM menu_items WHERE item_id = 990001;          -- 3
-
-  ROLLBACK TO SAVEPOINT before_order;                                                       -- undo the whole order
-  SELECT 'after ROLLBACK TO SAVEPOINT' AS step, stock_qty,
-         (SELECT COUNT(*) FROM orders WHERE customer_id = 990001) AS orders_left
-    FROM menu_items WHERE item_id = 990001;                                                 -- 5 and 0
-
-  DO $demo$ BEGIN                                           -- failed card: the whole order rolls back
-    PERFORM fn_place_order(990001, 'Dine-in', 990001, '[{"itemId":990001,"qty":1}]', NULL, NULL, 'Card', NULL, '0000');
-  EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'Rejected as expected: %', SQLERRM;
-  END $demo$;
-  SELECT 'after declined card' AS step, stock_qty,
-         (SELECT COUNT(*) FROM orders WHERE customer_id = 990001) AS orders_left
-    FROM menu_items WHERE item_id = 990001;                                                 -- still 5 and 0
-ROLLBACK;
-
-BEGIN ISOLATION LEVEL REPEATABLE READ;                      -- snapshot isolation: the whole tx sees one snapshot
-  SELECT current_setting('transaction_isolation') AS isolation_level, COUNT(*) AS menu_items_seen FROM menu_items;
-COMMIT;
 
 -- ---------------------------------------------------------------------
 -- 4.4  TWO-SESSION DEMOS (open two psql windows; run the steps in the order shown)

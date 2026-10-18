@@ -26,6 +26,7 @@ router.post('/reservations', wrap(async (req, res) => {
   res.status(201).json({ reservationId: r.id });
 }));
 router.get('/reservations/mine', wrap(async (req, res) => {
+  await query(actor(req), 'SELECT fn_expire_reservations()');           // old bookings become No-show / Completed
   res.json({ reservations: await query(actor(req), `SELECT r.reservation_id AS id, t.table_no AS "tableNo", r.party_size AS "partySize",
       r.start_time AS start, r.end_time AS "end", r.status FROM table_reservations r JOIN restaurant_tables t USING (table_id)
      WHERE r.customer_id = $1 ORDER BY r.start_time DESC LIMIT 30`, [req.user.id]) });

@@ -8,6 +8,10 @@ types.setTypeParser(20, parseInt);       // BIGINT  -> number
 const url = process.env.DATABASE_URL;
 if (!url) { console.error('DATABASE_URL is missing. Copy .env.example to .env and fill it in.'); process.exit(1); }
 const local = /localhost|127\.0\.0\.1/.test(url);
+// Least privilege: each request runs as a limited database role (created by db/08_security.sql).
+// Set USE_DB_ROLES=off only if you have not loaded 08_security.sql yet.
+const USE_ROLES = process.env.USE_DB_ROLES !== 'off';
+const DB_ROLE = { anonymous: 'df_anon', customer: 'df_customer', kitchen: 'df_kitchen', admin: 'df_admin' };
 const pool = new Pool({
   connectionString: url, max: 10,
   ssl: process.env.PGSSL === 'off' || local ? false : { rejectUnauthorized: false }
@@ -22,6 +26,7 @@ async function run(actor, fn) {
       await c.query(`SELECT set_config('search_path', 'dineflow, public, extensions', true),
                             set_config('dineflow.role', $1, true), set_config('dineflow.user_id', $2, true)`,
                     [actor.role || 'anonymous', actor.id == null ? '' : String(actor.id)]);
+      if (USE_ROLES) await c.query(`SET LOCAL ROLE ${DB_ROLE[actor.role || 'anonymous'] || 'df_anon'}`);   // whitelist, never user input
       const result = await fn(c);
       await c.query('COMMIT');
       return result;
